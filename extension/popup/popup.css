@@ -74,3 +74,5 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 }
 .switch input:checked + span { background: var(--accent); }
 .switch input:checked + span::before { transform: translateX(calc(100% + 0px)); }
+button.small { background: var(--accent); color: #fff; border: 0; border-radius: 5px; padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+button.small:disabled { opacity: .5; cursor: default; }

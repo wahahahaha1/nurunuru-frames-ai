@@ -8,7 +8,8 @@
     preset: 'standard', // fast | standard | quality
     target: 'display', // output rate: display | x2 | x2.5 | x3 (times the source fps) | fixed
     targetFps: 120, // used when target === 'fixed'
-    masking: 0, // 0..100: blend towards plain frame mixing where motion vectors are unreliable
+    hybrid: true, // also run block matching and use it where it explains the frames better than RIFE
+    masking: 0, // 0..100: show the nearer original frame where no motion is trusted
     sceneSensitivity: 60, // 0..100: higher = scene changes detected more readily
     audioSync: false, // delay audio by the interpolation latency (routes the video's audio through WebAudio)
     audioOffsetMs: 0, // extra audio delay (+) or advance (-)
@@ -49,6 +50,7 @@
   // Settings -> engine parameters
   S.engineParams = (s) => ({
     ...(S.PRESETS[s.preset] || S.PRESETS.standard),
+    hybrid: s.hybrid !== false,
     masking: s.masking / 100,
     sceneFrac: 0.9 - (0.75 * s.sceneSensitivity) / 100,
   });

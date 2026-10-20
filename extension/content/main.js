@@ -223,6 +223,7 @@
       const kind = this.clock.classify(m);
       if (kind === 'dup') return;
       if (kind === 'jump') this.flush();
+      if (this.capture) this.capture.onFrame(m);
       this.clock.observe(m, md, now);
       const reason = this.bypassReason();
       let f = null;
@@ -407,6 +408,7 @@
         meMs: this.perf.me,
         renderMs: this.perf.render,
         perfNote: this.perf.note,
+        capture: this.capture ? this.capture.state : '',
       };
     }
 
@@ -425,9 +427,27 @@
       );
     }
 
+    // Debug capture (popup button): source frames + interpolated output of the next few seconds.
+    startCapture(seconds) {
+      if (this.capture && this.capture.state === 'recording') return;
+      const st = this.status();
+      this.capture = new S.Capture(this.video, this.overlay.canvas, seconds, {
+        page: location.href,
+        src: st.src,
+        srcFps: st.srcFps,
+        displayHz: st.displayHz,
+        settings: this.settings,
+        preset: st.preset,
+        model: this.engine && this.engine.net.model,
+        modelSize: st.me,
+        userAgent: navigator.userAgent,
+      });
+    }
+
     destroy() {
       this.active = false;
       cancelAnimationFrame(this.rafId);
+      if (this.capture) this.capture.cancel();
       for (const [ev, fn] of Object.entries(this.handlers)) this.video.removeEventListener(ev, fn);
       document.removeEventListener('visibilitychange', this.onVis);
       this.audio.set(0);
@@ -487,7 +507,10 @@
   });
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (msg && msg.type === 'nnf-status' && player) {
+    if (msg && msg.type === 'nnf-capture' && player) {
+      player.startCapture(msg.seconds || 3);
+      sendResponse(player.status());
+    } else if (msg && msg.type === 'nnf-status' && player) {
       sendResponse(player.status());
     } else if (msg && msg.type === 'nnf-status' && blocked) {
       sendResponse({ site: site.name, state: 'bypass', reason: BLOCKED_REASON });

@@ -45,7 +45,7 @@
       $(id).value = settings[id];
       $(id + 'Out').textContent = fmt[id](settings[id]);
     }
-    for (const id of ['audioSync', 'demo', 'showVectors', 'osd']) $(id).checked = settings[id];
+    for (const id of ['hybrid', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).checked = settings[id];
   }
 
   function save(patch) {
@@ -65,7 +65,17 @@
     $(id).oninput = (e) => ($(id + 'Out').textContent = fmt[id](+e.target.value));
     $(id).onchange = (e) => save({ [id]: +e.target.value });
   }
-  for (const id of ['audioSync', 'demo', 'showVectors', 'osd']) $(id).onchange = (e) => save({ [id]: e.target.checked });
+  for (const id of ['hybrid', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).onchange = (e) => save({ [id]: e.target.checked });
+
+  $('capture').onclick = async () => {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab) await chrome.tabs.sendMessage(tab.id, { type: 'nnf-capture', seconds: 3 });
+    } catch (e) {
+      $('captureHint').textContent = 'このタブでは記録できません（YouTube / ニコニコ動画の再生中に押してください）';
+    }
+    refreshStatus();
+  };
 
   $('bench').onclick = (e) => {
     e.preventDefault();
@@ -84,6 +94,10 @@
       st = null;
     }
     lastStatus = st;
+    if (st && st.capture) {
+      $('captureHint').textContent = st.capture === 'recording' ? '記録中…（動画を再生したままにしてください）' : st.capture === 'saving' ? '保存中…' : st.capture;
+    }
+    $('capture').disabled = !!(st && (st.capture === 'recording' || st.capture === 'saving'));
     renderTargetHint();
     if (!st) {
       el.className = 'status';

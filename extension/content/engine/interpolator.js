@@ -27,9 +27,11 @@
         fragment: { module: ingestMod, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
       });
       this.tensorPipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.toTensor, 'to-tensor'), entryPoint: 'main' } });
+      this.selectPipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.select, 'select'), entryPoint: 'main' } });
+      this.bm = new S.BlockMatcher(device, this.samp);
       this.renderMod = mod(W.render, 'render');
       this.renderPipes = new Map();
-      this.renderU = device.createBuffer({ size: 48, usage: BU.UNIFORM | BU.COPY_DST });
+      this.renderU = device.createBuffer({ size: 64, usage: BU.UNIFORM | BU.COPY_DST });
       this.zeroTex = device.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: TU.TEXTURE_BINDING });
       this.zeroStats = device.createBuffer({ size: 16, usage: BU.STORAGE });
       this.res = null;
@@ -159,14 +161,17 @@
           tensor: d.createBuffer({ size: S.RifeNet.tensorSize(pw, ph) * 4, usage: BU.STORAGE }),
           flow: d.createTexture({ size: [mw, mh], format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
           mask: d.createTexture({ size: [mw, mh], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
+          sel: d.createTexture({ size: [mw, mh], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
           stats: d.createBuffer({ size: 16, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC }),
           id: -1, // sequence number of the frame currently held
           hasPair: false, // RIFE result for (id-1 -> id) is complete
+          hasSel: false, // ... together with block matching and the selection map
           feat: false, // Head features of the current frame are submitted
           pairPrevId: -1,
         };
         fr.flowView = fr.flow.createView();
         fr.maskView = fr.mask.createView();
+        fr.selView = fr.sel.createView();
         fr.tensorBG = d.createBindGroup({
           layout: this.tensorPipe.getBindGroupLayout(0),
           entries: [
@@ -178,12 +183,47 @@
         });
         frames.push(fr);
       }
+      this.bm.configure(frames, fw, srcW, srcH);
+      const [fsx, fsy] = this.bm.fieldScale();
+      const selectU = uni(new Float32Array([fsx, fsy, mw, mh]));
       this.jobs = [];
       this.stepMs = new Map();
+      this.res = { srcW, srcH, fw, fh, mw, mh, pw, ph, ingestU, tensorU, selectU, frames, next: 0 };
       // step keys of a typical job (one Head + the pair), for jobMs()
-      const jobKeys = [...this.net.headSteps(frames[0].tensor), ...this.net.job(frames[0].tensor, frames[1].tensor, frames[1])].map((st) => st.key);
-      this.res = { srcW, srcH, fw, fh, mw, mh, pw, ph, ingestU, tensorU, frames, next: 0, jobKeys };
+      this.res.jobKeys = this.pairSteps(frames[0], frames[1], true).map((st) => st.key);
       return true;
+    }
+
+    // Steps of the pair (a -> b) after the Head features: block matching (if used), RIFE, selection map.
+    pairSteps(a, b, useBM) {
+      const steps = [];
+      if (useBM) steps.push(...this.bm.steps(a, b));
+      steps.push(...this.net.job(a.tensor, b.tensor, b));
+      if (useBM) {
+        const r = this.res;
+        steps.push({
+          key: 'sel',
+          pipe: this.selectPipe,
+          block: -2,
+          kind: 'bm',
+          bg: this.device.createBindGroup({
+            layout: this.selectPipe.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: r.selectU } },
+              { binding: 1, resource: this.samp },
+              { binding: 2, resource: a.view },
+              { binding: 3, resource: b.view },
+              { binding: 4, resource: b.flowView },
+              { binding: 5, resource: b.bm.fieldFView },
+              { binding: 6, resource: b.bm.fieldGView },
+              { binding: 7, resource: b.selView },
+            ],
+          }),
+          wg: [Math.ceil(r.mw / 16), Math.ceil(r.mh / 16), 1],
+          cost: r.mw * r.mh * 300,
+        });
+      }
+      return steps;
     }
 
     destroyResources() {
@@ -193,16 +233,20 @@
         f.tensor.destroy();
         f.flow.destroy();
         f.mask.destroy();
+        f.sel.destroy();
         f.stats.destroy();
       }
+      this.bm.destroyResources();
       this.res.ingestU.destroy();
       this.res.tensorU.destroy();
+      this.res.selectU.destroy();
       this.jobs = [];
       this.res = null;
     }
 
     destroy() {
       this.destroyResources();
+      this.bm.destroy();
       this.renderU.destroy();
       this.zeroTex.destroy();
       this.zeroStats.destroy();
@@ -224,6 +268,7 @@
       r.next = (r.next + 1) % RING;
       f.id = ++this.seq;
       f.hasPair = false;
+      f.hasSel = false;
       f.pairPrevId = -1;
       f.feat = false;
       const ext = d.importExternalTexture({ source });
@@ -247,6 +292,7 @@
       cp.setPipeline(this.tensorPipe);
       cp.setBindGroup(0, f.tensorBG);
       cp.dispatchWorkgroups(Math.ceil(r.pw / 16), Math.ceil(r.ph / 16));
+      this.bm.encodeLuma(cp, f);
       cp.end();
       enc.clearBuffer(f.stats);
       d.queue.submit([enc.finish()]);
@@ -268,7 +314,8 @@
         steps.push(...this.net.headSteps(f.tensor));
         job.marks.push([steps.length, f]); // features of f are submitted once steps[0, n) are
       }
-      steps.push(...this.net.job(job.a.tensor, job.b.tensor, job.b));
+      job.useBM = this.params.hybrid !== false;
+      steps.push(...this.pairSteps(job.a, job.b, job.useBM));
       job.steps = steps;
       if (job.measure) job.ms = new Array(steps.length).fill(0);
     }
@@ -334,6 +381,7 @@
         cp.setPipeline(s.pipe);
         cp.setBindGroup(0, s.bg);
         cp.dispatchWorkgroups(...s.wg);
+        if (s.after) s.after();
       }
       cp.end();
       job.next = last;
@@ -349,6 +397,7 @@
       }
       if (last === steps.length) {
         job.b.hasPair = true;
+        job.b.hasSel = job.useBM;
         job.b.pairPrevId = job.aId;
         this.jobs.shift();
       }
@@ -419,15 +468,18 @@
       let mode = opts.mode || 0;
       // no inference result (yet): show the nearer frame rather than a ghosting blend
       if (!paired && (mode === 0 || mode === 4)) mode = b === a || t < 0.5 ? 1 : 2;
-      const buf = new ArrayBuffer(48);
+      const sel = paired && b.hasSel;
+      const buf = new ArrayBuffer(64);
       const f = new Float32Array(buf);
       const u = new Uint32Array(buf);
       f.set(rect, 0);
-      f[4] = t;
-      u[5] = mode;
-      f[6] = opts.masking ?? p.masking;
-      f[7] = p.sceneFrac;
-      f[8] = opts.split || 0;
+      f.set(this.bm.fieldScale(), 4);
+      f[6] = t;
+      u[7] = mode;
+      f[8] = opts.masking ?? p.masking;
+      f[9] = p.sceneFrac;
+      f[10] = opts.split || 0;
+      f[11] = sel ? (opts.hybrid ?? 1) : -1;
       d.queue.writeBuffer(this.renderU, 0, buf);
       const pipe = this.renderPipe(format);
       const zero = this.zeroTex.createView();
@@ -441,6 +493,9 @@
           { binding: 4, resource: paired ? b.flowView : zero },
           { binding: 5, resource: paired ? b.maskView : zero },
           { binding: 6, resource: { buffer: paired ? b.stats : this.zeroStats } },
+          { binding: 7, resource: sel ? b.bm.fieldFView : zero },
+          { binding: 8, resource: sel ? b.bm.fieldGView : zero },
+          { binding: 9, resource: sel ? b.selView : zero },
         ],
       });
       const enc = d.createCommandEncoder();

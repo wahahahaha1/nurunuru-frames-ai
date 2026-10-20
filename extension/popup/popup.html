@@ -38,6 +38,8 @@
     <button data-v="fast">速度優先</button><button data-v="standard">標準</button><button data-v="quality">高画質</button>
   </div>
   <div class="hint">速度優先: RIFE 4.25 lite 幅 768／標準: RIFE 4.25 幅 960／高画質: RIFE 4.25 幅 1280</div>
+  <div class="row"><span>ブロックマッチングと併用（ハイブリッド）</span><label class="switch"><input type="checkbox" id="hybrid"><span></span></label></div>
+  <div class="hint">従来方式の動き推定も行い、そちらが前後のフレームをよく説明できる場所（パンや細かい模様）ではそちらを使います</div>
   <div class="label">アーティファクトマスキング <output id="maskingOut"></output></div>
   <input type="range" id="masking" min="0" max="100" step="5">
   <div class="label">シーンチェンジ検出感度 <output id="sceneSensitivityOut"></output></div>
@@ -54,6 +56,11 @@
   <div class="row"><span>デモ表示（左: 元 / 右: 補間）</span><label class="switch"><input type="checkbox" id="demo"><span></span></label></div>
   <div class="row"><span>フロー表示</span><label class="switch"><input type="checkbox" id="showVectors"><span></span></label></div>
   <div class="row"><span>統計 OSD</span><label class="switch"><input type="checkbox" id="osd"><span></span></label></div>
+</section>
+
+<section>
+  <div class="row"><span>検証用に記録（元フレームと出力を保存）</span><button id="capture" class="small">3 秒記録</button></div>
+  <div class="hint" id="captureHint">押すと、これから 3 秒分の元の動画フレーム（PNG の zip）と補間後の映像（WebM）をダウンロードフォルダに保存します。補間の検証用で、保存先はこの PC だけです。</div>
 </section>
 
 <footer>Alt+Shift+S: ON/OFF　Alt+Shift+D: デモ表示<br><a href="#" id="bench">この PC の GPU でベンチマークを測る</a></footer>

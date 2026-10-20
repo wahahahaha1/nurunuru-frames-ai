@@ -498,24 +498,100 @@ fn lumAt(buf: u32, p: vec2f) -> f32 {
 }
 `;
 
+  // Block matching at phase t (NuruNuru Frames' renderer): the forward / backward block fields are
+  // aligned to t by fixed-point iteration, both frames are warped along each and the two
+  // predictions are weighted by how well they agree; where neither agrees (occlusion) the nearer,
+  // one-sided sample is taken. Returns (colour, photometric error).
+  const bmInterp = /* wgsl */ `
+fn Fb(p: vec2f) -> vec4f { return textureSampleLevel(fieldF, samp, p * U.fieldScale, 0.0); }
+fn Gb(p: vec2f) -> vec4f { return textureSampleLevel(fieldG, samp, p * U.fieldScale, 0.0); }
+
+fn bmInterp(p: vec2f, t: f32) -> vec4f {
+  var v = Fb(p).xy;
+  for (var i = 0; i < 3; i++) { v = Fb(p - t * v).xy; }
+  var w = Gb(p).xy;
+  for (var i = 0; i < 3; i++) { w = Gb(p - (1.0 - t) * w).xy; }
+  let fq = Fb(p - t * v);
+  let gq = Gb(p - (1.0 - t) * w);
+  let a0 = A(p - t * v);
+  let b0 = B(p + (1.0 - t) * v);
+  let b1 = B(p - (1.0 - t) * w);
+  let a1 = A(p + t * w);
+  let pF = abs(lum(a0) - lum(b0));
+  let pG = abs(lum(a1) - lum(b1));
+  let eF = pF + 0.5 * fq.z;
+  let eG = pG + 0.5 * gq.z;
+  let wF = (1.0 - t + 0.05) * exp(-eF * 30.0);
+  let wG = (t + 0.05) * exp(-eG * 30.0);
+  var col = (wF * mix(a0, b0, t) + wG * mix(a1, b1, t)) / max(wF + wG, 1e-6);
+  let bad = smoothstep(0.06, 0.16, min(eF, eG));
+  var side: vec3f;
+  if (t < 0.5) { side = select(a1, a0, fq.z <= gq.z); } else { side = select(b1, b0, fq.z <= gq.z); }
+  col = mix(col, side, bad);
+  return vec4f(col, min(pF, pG));
+}
+`;
+
+  // Per pair, on the mid-time grid (picture size): which motion to trust where. Compares, averaged
+  // over a 3x3 neighbourhood, how well each explains the two frames at t = 0.5 (photometric error of
+  // its two warps): r = weight of block matching (only where it is clearly better and itself
+  // consistent; occlusions, where both disagree, stay with RIFE and its mask), g = confidence (low
+  // where both disagree).
+  const select = /* wgsl */ `
+struct SU { fieldScale: vec2f, size: vec2f };
+@group(0) @binding(0) var<uniform> U: SU;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var texA: texture_2d<f32>;
+@group(0) @binding(3) var texB: texture_2d<f32>;
+@group(0) @binding(4) var flowT: texture_2d<f32>;
+@group(0) @binding(5) var fieldF: texture_2d<f32>;
+@group(0) @binding(6) var fieldG: texture_2d<f32>;
+@group(0) @binding(7) var selOut: texture_storage_2d<rgba8unorm, write>;
+
+fn A(p: vec2f) -> vec3f { return textureSampleLevel(texA, samp, p, 0.0).rgb; }
+fn B(p: vec2f) -> vec3f { return textureSampleLevel(texB, samp, p, 0.0).rgb; }
+fn lum(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
+${bmInterp}
+@compute @workgroup_size(16, 16) fn main(@builtin(global_invocation_id) g: vec3u) {
+  if (f32(g.x) >= U.size.x || f32(g.y) >= U.size.y) { return; }
+  let p0 = (vec2f(g.xy) + 0.5) / U.size;
+  var eA = 0.0;
+  var eB = 0.0;
+  for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+      let p = p0 + vec2f(f32(dx), f32(dy)) / U.size;
+      let f = textureSampleLevel(flowT, samp, p, 0.0);
+      eA += abs(lum(A(p + f.xy)) - lum(B(p + f.zw)));
+      eB += bmInterp(p, 0.5).w;
+    }
+  }
+  eA /= 9.0;
+  eB /= 9.0;
+  let wBM = smoothstep(0.0005, 0.004, eA - eB) * (1.0 - smoothstep(0.03, 0.08, eB));
+  let conf = 1.0 - smoothstep(0.05, 0.15, min(eA, eB));
+  textureStore(selOut, g.xy, vec4f(wBM, conf, 0.0, 1.0));
+}
+`;
+
   // Interpolated frame at phase t, rendered straight into the output (canvas or test texture).
   // A point at q on the mid-time grid sits at q + f0 in A, q + f1 in B and, assuming piecewise
   // linear motion through q at t = 0.5, at q + (1 - 2t) f0 (t < 0.5) or q + (2t - 1) f1 (t > 0.5).
   // For each output pixel p the mid-time point is found by fixed-point iteration; both frames are
   // then sampled there and blended with RIFE's mask, shifted towards the nearer frame. At t = 0.5
   // this is exactly RIFE's output.
+  // With block matching (hybrid > 0) its result replaces RIFE's where the selection map says so.
+  // Masking: where neither motion is trusted, fall back towards the nearer original frame (no ghosting).
   // mode: 0 interpolate, 1 frame A, 2 frame B, 3 plain blend, 4 flow visualisation
   const render = fullscreenVS + /* wgsl */ `
 struct RU {
   rect: vec4f,
+  fieldScale: vec2f,
   t: f32,
   mode: u32,
   masking: f32,
   sceneFrac: f32,
   split: f32,
-  pad0: f32,
-  pad1: f32,
-  pad2: f32,
+  hybrid: f32, // weight of block matching where selected; < 0: no block matching / selection map
 };
 @group(0) @binding(0) var<uniform> U: RU;
 @group(0) @binding(1) var samp: sampler;
@@ -524,13 +600,16 @@ struct RU {
 @group(0) @binding(4) var flowT: texture_2d<f32>;
 @group(0) @binding(5) var maskT: texture_2d<f32>;
 @group(0) @binding(6) var<storage, read> stats: array<u32, 4>;
+@group(0) @binding(7) var fieldF: texture_2d<f32>;
+@group(0) @binding(8) var fieldG: texture_2d<f32>;
+@group(0) @binding(9) var selT: texture_2d<f32>;
 
 fn A(p: vec2f) -> vec3f { return textureSampleLevel(texA, samp, p, 0.0).rgb; }
 fn B(p: vec2f) -> vec3f { return textureSampleLevel(texB, samp, p, 0.0).rgb; }
 fn Fl(p: vec2f) -> vec4f { return textureSampleLevel(flowT, samp, p, 0.0); }
 fn Mk(p: vec2f) -> vec4f { return textureSampleLevel(maskT, samp, p, 0.0); }
 fn lum(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
-
+${bmInterp}
 fn hue(h: f32) -> vec3f {
   return clamp(abs(fract(h + vec3f(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, vec3f(0.0), vec3f(1.0));
 }
@@ -551,10 +630,17 @@ fn interp(p: vec2f, t: f32) -> vec3f {
   let wa = mk.r * (1.0 - t);
   let wb = (1.0 - mk.r) * t;
   var col = (wa * a + wb * b) / max(wa + wb, 1e-6);
-  // Optional artifact masking: fall back towards a plain blend where the two warps disagree.
+  var conf = 1.0 - smoothstep(0.08, 0.25, abs(lum(a) - lum(b)));
+  if (U.hybrid >= 0.0) {
+    let sel = textureSampleLevel(selT, samp, p, 0.0);
+    let w = sel.r * U.hybrid;
+    if (w > 0.002) { col = mix(col, bmInterp(p, t).rgb, w); }
+    conf = sel.g;
+  }
+  // Optional artifact masking: where no motion is trusted, show the nearer original frame instead.
   if (U.masking > 0.0) {
-    let u = smoothstep(0.08, 0.25, abs(lum(a) - lum(b)));
-    col = mix(col, mix(A(p), B(p), t), U.masking * u);
+    let near = select(B(p), A(p), t < 0.5);
+    col = mix(col, near, U.masking * (1.0 - conf));
   }
   return col;
 }
@@ -584,5 +670,5 @@ fn interp(p: vec2f, t: f32) -> vec3f {
 }
 `;
 
-  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, pack, render };
+  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, pack, select, render };
 })();
