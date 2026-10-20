@@ -533,7 +533,7 @@ fn bmInterp(p: vec2f, t: f32) -> vec4f {
 `;
 
   // Per pair, on the mid-time grid (picture size): which motion to trust where. Compares, averaged
-  // over a 3x3 neighbourhood, how well each explains the two frames at t = 0.5 (photometric error of
+  // over +-4 px (5x5 samples), how well each explains the two frames at t = 0.5 (photometric error of
   // its two warps): r = weight of block matching (only where it is clearly better and itself
   // consistent), g = confidence (low where both disagree). Where RIFE's mask clearly prefers one
   // frame (occlusion: the other warp is expected to disagree) its error does not count, and block
@@ -571,9 +571,9 @@ ${bmInterp}
   var eH = 0.0;
   var eB = 0.0;
   var occ = 0.0;
-  for (var dy = -1; dy <= 1; dy++) {
-    for (var dx = -1; dx <= 1; dx++) {
-      let p = p0 + vec2f(f32(dx), f32(dy)) / U.size;
+  for (var dy = -2; dy <= 2; dy++) {
+    for (var dx = -2; dx <= 2; dx++) {
+      let p = p0 + vec2f(f32(dx), f32(dy)) * 2.0 / U.size;
       let ra = rifeErr(p, flowT, maskT);
       eA += ra.x;
       occ = max(occ, ra.y);
@@ -581,14 +581,15 @@ ${bmInterp}
       eB += bmInterp(p, 0.5).w;
     }
   }
-  eA /= 9.0;
-  eH /= 9.0;
-  eB /= 9.0;
+  eA /= 25.0;
+  eH /= 25.0;
+  eB /= 25.0;
   // half-resolution RIFE where it explains the frames clearly better (large motion)
   let wH = smoothstep(0.002, 0.01, eA - eH) * U.useHalf;
   eA = mix(eA, eH, wH);
   // motion boundaries (either motion varies by more than a pixel within +-4 px): block matching's
-  // blocks straddle them, so RIFE keeps them
+  // blocks straddle them, so RIFE keeps them. RIFE's flow only counts where RIFE itself explains the
+  // frames: where it fails (e.g. scrolling text) its flow is ragged while block matching is right.
   var lo = vec4f(1e9);
   var hi = vec4f(-1e9);
   for (var dy = -2; dy <= 2; dy++) {
@@ -600,8 +601,12 @@ ${bmInterp}
       hi = max(hi, m);
     }
   }
-  let spread = max(max(hi.x - lo.x, hi.y - lo.y), max(hi.z - lo.z, hi.w - lo.w));
-  let wBM = smoothstep(-0.001, 0.002, eA - eB) * (1.0 - smoothstep(0.03, 0.08, eB)) * (1.0 - smoothstep(0.5, 0.8, occ))
+  let rifeOk = 1.0 - smoothstep(0.01, 0.03, eA);
+  let spread = max(max(hi.x - lo.x, hi.y - lo.y) * rifeOk, max(hi.z - lo.z, hi.w - lo.w));
+  // (a one-sided RIFE mask hints at occlusion, but RIFE also leans on one frame where both match:
+  // block matching that explains the frames almost perfectly is still taken there)
+  let wBM = smoothstep(-0.001, 0.002, eA - eB) * (1.0 - smoothstep(0.03, 0.08, eB))
+    * (1.0 - smoothstep(0.5, 0.8, occ) * smoothstep(0.004, 0.015, eB))
     * (1.0 - smoothstep(1.0, 2.5, spread));
   let conf = 1.0 - smoothstep(0.05, 0.15, min(eA, eB));
   textureStore(selOut, g.xy, vec4f(wBM, conf, wH, 1.0));
@@ -692,7 +697,8 @@ fn toward(f: vec4f, lo: bool) -> vec2f { return select(f.zw, f.xy, lo); }
 // The fixed point is iterated from three starts (no motion, and one step along / against the motion
 // at p); the candidate that lands closest to p wins, where a point RIFE's mask says is only visible
 // in the farther frame (it appears from behind something) loses against one that is visible on our
-// side. Returns (colour, cost); cost = how far (model pixels) the best candidate misses p.
+// side (this only ranks the candidates). Returns (colour, miss): how far (model pixels) the chosen
+// candidate lands from p.
 fn rifeAt(p: vec2f, t: f32, tau: f32, fT: texture_2d<f32>, mT: texture_2d<f32>) -> vec4f {
   let lo = t < tau;
   let c = select((t - tau) / (1.0 - tau), (tau - t) / tau, lo);
@@ -703,6 +709,7 @@ fn rifeAt(p: vec2f, t: f32, tau: f32, fT: texture_2d<f32>, mT: texture_2d<f32>) 
   var starts = array<vec2f, 3>(p, p - m0, p + m0);
   var q = p;
   var best = 1e9;
+  var miss = 1e9;
   for (var k = 0; k < 3; k++) {
     var r = starts[k];
     for (var i = 0; i < 5; i++) { r = p - c * toward(textureSampleLevel(fT, samp, r, 0.0), lo); }
@@ -710,15 +717,17 @@ fn rifeAt(p: vec2f, t: f32, tau: f32, fT: texture_2d<f32>, mT: texture_2d<f32>) 
     let m = textureSampleLevel(mT, samp, r, 0.0).r;
     let hidden = smoothstep(0.75, 0.95, select(m, 1.0 - m, lo)) * c;
     let cost = res + 3.0 * hidden;
-    if (cost < best) { best = cost; q = r; }
+    if (cost < best) { best = cost; miss = res; q = r; }
   }
   let f = textureSampleLevel(fT, samp, q, 0.0);
   let m = textureSampleLevel(mT, samp, q, 0.0).r;
   let a = sharp(texA, q + f.xy);
   let b = sharp(texB, q + f.zw);
-  let wa = m * (1.0 - s);
-  let wb = (1.0 - m) * s;
-  return vec4f((wa * a + wb * b) / max(wa + wb, 1e-6), best);
+  // RIFE's blend weight m, shifted towards the nearer frame (squared time weights: equal at s = 0.5,
+  // so t = tau is RIFE's own output; where m is one-sided (occlusion) it still wins)
+  let wa = m * (1.0 - s) * (1.0 - s);
+  let wb = (1.0 - m) * s * s;
+  return vec4f((wa * a + wb * b) / max(wa + wb, 1e-6), miss);
 }
 
 fn interp(p: vec2f, t: f32) -> vec3f {
