@@ -552,12 +552,13 @@ struct SU { fieldScale: vec2f, size: vec2f, useHalf: f32, pad0: f32, pad1: f32, 
 @group(0) @binding(9) var flowH: texture_2d<f32>;
 @group(0) @binding(10) var maskH: texture_2d<f32>;
 
-// photometric disagreement of a RIFE result's two warps at p; not counted where its mask picks one
-// frame only (occlusion: the other warp is expected to disagree). Returns (error, one-sidedness).
-fn rifeErr(p: vec2f, fT: texture_2d<f32>, mT: texture_2d<f32>) -> vec2f {
+// photometric disagreement of a RIFE result's two warps at p: (error not counted where its mask
+// picks one frame only (occlusion: the other warp is expected to disagree), one-sidedness, raw error)
+fn rifeErr(p: vec2f, fT: texture_2d<f32>, mT: texture_2d<f32>) -> vec3f {
   let f = textureSampleLevel(fT, samp, p, 0.0);
   let side = abs(2.0 * textureSampleLevel(mT, samp, p, 0.0).r - 1.0);
-  return vec2f(abs(lum(A(p + f.xy)) - lum(B(p + f.zw))) * (1.0 - side), side);
+  let e = abs(lum(A(p + f.xy)) - lum(B(p + f.zw)));
+  return vec3f(e * (1.0 - side), side, e);
 }
 
 fn A(p: vec2f) -> vec3f { return textureSampleLevel(texA, samp, p, 0.0).rgb; }
@@ -568,6 +569,7 @@ ${bmInterp}
   if (f32(g.x) >= U.size.x || f32(g.y) >= U.size.y) { return; }
   let p0 = (vec2f(g.xy) + 0.5) / U.size;
   var eA = 0.0;
+  var eAraw = 0.0;
   var eH = 0.0;
   var eB = 0.0;
   var occ = 0.0;
@@ -576,22 +578,31 @@ ${bmInterp}
       let p = p0 + vec2f(f32(dx), f32(dy)) * 2.0 / U.size;
       let ra = rifeErr(p, flowT, maskT);
       eA += ra.x;
+      eAraw += ra.z;
       occ = max(occ, ra.y);
       if (U.useHalf > 0.0) { eH += rifeErr(p, flowH, maskH).x; }
       eB += bmInterp(p, 0.5).w;
     }
   }
   eA /= 25.0;
+  eAraw /= 25.0;
   eH /= 25.0;
   eB /= 25.0;
+  // a true occlusion defeats block matching too; where block matching explains both frames, RIFE's
+  // one-sided mask is not an excuse and its full disagreement counts
+  let bmGood = 1.0 - smoothstep(0.004, 0.015, eB);
+  eA = mix(eA, eAraw, bmGood);
   // half-resolution RIFE where it explains the frames clearly better (large motion)
   let wH = smoothstep(0.002, 0.01, eA - eH) * U.useHalf;
   eA = mix(eA, eH, wH);
   // motion boundaries (either motion varies by more than a pixel within +-4 px): block matching's
   // blocks straddle them, so RIFE keeps them. RIFE's flow only counts where RIFE itself explains the
   // frames: where it fails (e.g. scrolling text) its flow is ragged while block matching is right.
+  // Local structure tells how informative the errors above are.
   var lo = vec4f(1e9);
   var hi = vec4f(-1e9);
+  var tex = 0.0;
+  let e1 = vec2f(1.0) / U.size;
   for (var dy = -2; dy <= 2; dy++) {
     for (var dx = -2; dx <= 2; dx++) {
       let p = p0 + vec2f(f32(dx), f32(dy)) * 2.0 / U.size;
@@ -599,13 +610,17 @@ ${bmInterp}
       let m = vec4f(f.zw - f.xy, Fb(p).xy) * vec4f(U.size, U.size);
       lo = min(lo, m);
       hi = max(hi, m);
+      tex += abs(lum(A(p + vec2f(e1.x, 0.0))) - lum(A(p - vec2f(e1.x, 0.0)))) + abs(lum(A(p + vec2f(0.0, e1.y))) - lum(A(p - vec2f(0.0, e1.y))));
     }
   }
+  tex = smoothstep(0.01, 0.04, tex / 25.0); // 0 = flat, errors say little
   let rifeOk = 1.0 - smoothstep(0.01, 0.03, eA);
   let spread = max(max(hi.x - lo.x, hi.y - lo.y) * rifeOk, max(hi.z - lo.z, hi.w - lo.w));
   // (a one-sided RIFE mask hints at occlusion, but RIFE also leans on one frame where both match:
   // block matching that explains the frames almost perfectly is still taken there)
-  let wBM = smoothstep(-0.001, 0.002, eA - eB) * (1.0 - smoothstep(0.03, 0.08, eB))
+  // ties go to block matching only where the picture has structure; in flat areas it must win clearly
+  let tie = mix(0.002, -0.001, tex);
+  let wBM = smoothstep(tie, tie + 0.003, eA - eB) * (1.0 - smoothstep(0.03, 0.08, eB))
     * (1.0 - smoothstep(0.5, 0.8, occ) * smoothstep(0.004, 0.015, eB))
     * (1.0 - smoothstep(1.0, 2.5, spread));
   let conf = 1.0 - smoothstep(0.05, 0.15, min(eA, eB));
