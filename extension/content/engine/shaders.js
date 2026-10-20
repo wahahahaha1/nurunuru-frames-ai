@@ -69,14 +69,14 @@ struct TU { cw: u32, ch: u32, pw: u32, ph: u32, taps: u32, pad0: u32, pad1: u32,
 }
 `;
 
-  // Block input at the block's resolution: bilinear downscale (PyTorch align_corners=False) of
+  // Block input at the block's resolution (ts = the timestep being inferred): bilinear downscale (PyTorch align_corners=False) of
   //   first block: img0, img1, feat0, feat1, timestep                                   (15 channels)
   //   later:  warp(img0, f0), warp(img1, f1), warp(feat0, f0), warp(feat1, f1), timestep,
   //           mask, block features, (f0, f1) / scale                                    (28 channels)
   // Frame tensors hold RGB (planes 0-2) and the Head features (planes 3-6). Warping = bilinear
   // sampling at x + flow with border clamp (grid_sample, align_corners=True).
   const prep = /* wgsl */ `
-struct PU { pw: u32, ph: u32, bw: u32, bh: u32, scale: f32, first: u32, pad0: u32, pad1: u32 };
+struct PU { pw: u32, ph: u32, bw: u32, bh: u32, scale: f32, first: u32, ts: f32, pad1: u32 };
 @group(0) @binding(0) var<uniform> U: PU;
 @group(0) @binding(1) var<storage, read> img0: array<f32>;
 @group(0) @binding(2) var<storage, read> img1: array<f32>;
@@ -133,7 +133,7 @@ fn pixel(x: u32, y: u32) -> array<f32, 28> {
   }
   for (var c = 0u; c < 3u; c++) { v[c] = a[c]; v[3u + c] = b[c]; }
   for (var c = 0u; c < 4u; c++) { v[6u + c] = fa[c]; v[10u + c] = fb[c]; }
-  v[14] = 0.5;
+  v[14] = U.ts;
   if (U.first == 0u) {
     for (var c = 0u; c < 9u; c++) { v[15u + c] = fm[(4u + c) * plane + i]; } // mask + 8 features
     for (var c = 0u; c < 4u; c++) { v[24u + c] = flow[c]; }
@@ -539,7 +539,7 @@ fn bmInterp(p: vec2f, t: f32) -> vec4f {
   // frame (occlusion: the other warp is expected to disagree) its error does not count, and block
   // matching is not used.
   const select = /* wgsl */ `
-struct SU { fieldScale: vec2f, size: vec2f };
+struct SU { fieldScale: vec2f, size: vec2f, useHalf: f32, pad0: f32, pad1: f32, pad2: f32 };
 @group(0) @binding(0) var<uniform> U: SU;
 @group(0) @binding(1) var samp: sampler;
 @group(0) @binding(2) var texA: texture_2d<f32>;
@@ -549,6 +549,16 @@ struct SU { fieldScale: vec2f, size: vec2f };
 @group(0) @binding(6) var fieldG: texture_2d<f32>;
 @group(0) @binding(7) var selOut: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(8) var maskT: texture_2d<f32>;
+@group(0) @binding(9) var flowH: texture_2d<f32>;
+@group(0) @binding(10) var maskH: texture_2d<f32>;
+
+// photometric disagreement of a RIFE result's two warps at p; not counted where its mask picks one
+// frame only (occlusion: the other warp is expected to disagree). Returns (error, one-sidedness).
+fn rifeErr(p: vec2f, fT: texture_2d<f32>, mT: texture_2d<f32>) -> vec2f {
+  let f = textureSampleLevel(fT, samp, p, 0.0);
+  let side = abs(2.0 * textureSampleLevel(mT, samp, p, 0.0).r - 1.0);
+  return vec2f(abs(lum(A(p + f.xy)) - lum(B(p + f.zw))) * (1.0 - side), side);
+}
 
 fn A(p: vec2f) -> vec3f { return textureSampleLevel(texA, samp, p, 0.0).rgb; }
 fn B(p: vec2f) -> vec3f { return textureSampleLevel(texB, samp, p, 0.0).rgb; }
@@ -558,20 +568,25 @@ ${bmInterp}
   if (f32(g.x) >= U.size.x || f32(g.y) >= U.size.y) { return; }
   let p0 = (vec2f(g.xy) + 0.5) / U.size;
   var eA = 0.0;
+  var eH = 0.0;
   var eB = 0.0;
   var occ = 0.0;
   for (var dy = -1; dy <= 1; dy++) {
     for (var dx = -1; dx <= 1; dx++) {
       let p = p0 + vec2f(f32(dx), f32(dy)) / U.size;
-      let f = textureSampleLevel(flowT, samp, p, 0.0);
-      let side = abs(2.0 * textureSampleLevel(maskT, samp, p, 0.0).r - 1.0); // 1 = one frame only
-      eA += abs(lum(A(p + f.xy)) - lum(B(p + f.zw))) * (1.0 - side);
-      occ = max(occ, side);
+      let ra = rifeErr(p, flowT, maskT);
+      eA += ra.x;
+      occ = max(occ, ra.y);
+      if (U.useHalf > 0.0) { eH += rifeErr(p, flowH, maskH).x; }
       eB += bmInterp(p, 0.5).w;
     }
   }
   eA /= 9.0;
+  eH /= 9.0;
   eB /= 9.0;
+  // half-resolution RIFE where it explains the frames clearly better (large motion)
+  let wH = smoothstep(0.002, 0.01, eA - eH) * U.useHalf;
+  eA = mix(eA, eH, wH);
   // motion boundaries (either motion varies by more than a pixel within +-4 px): block matching's
   // blocks straddle them, so RIFE keeps them
   var lo = vec4f(1e9);
@@ -589,7 +604,7 @@ ${bmInterp}
   let wBM = smoothstep(0.0005, 0.004, eA - eB) * (1.0 - smoothstep(0.03, 0.08, eB)) * (1.0 - smoothstep(0.5, 0.8, occ))
     * (1.0 - smoothstep(1.0, 2.5, spread));
   let conf = 1.0 - smoothstep(0.05, 0.15, min(eA, eB));
-  textureStore(selOut, g.xy, vec4f(wBM, conf, 0.0, 1.0));
+  textureStore(selOut, g.xy, vec4f(wBM, conf, wH, 1.0));
 }
 `;
 
@@ -612,6 +627,10 @@ struct RU {
   sceneFrac: f32,
   split: f32,
   hybrid: f32, // weight of block matching where selected; < 0: no block matching / selection map
+  tau: f32, // timestep of the extra RIFE anchor bound as flowX / maskX (0.5 = none)
+  pad0: f32,
+  pad1: f32,
+  pad2: f32,
 };
 @group(0) @binding(0) var<uniform> U: RU;
 @group(0) @binding(1) var samp: sampler;
@@ -623,6 +642,10 @@ struct RU {
 @group(0) @binding(7) var fieldF: texture_2d<f32>;
 @group(0) @binding(8) var fieldG: texture_2d<f32>;
 @group(0) @binding(9) var selT: texture_2d<f32>;
+@group(0) @binding(10) var flowX: texture_2d<f32>;
+@group(0) @binding(11) var maskX: texture_2d<f32>;
+@group(0) @binding(12) var flowH: texture_2d<f32>;
+@group(0) @binding(13) var maskH: texture_2d<f32>;
 
 fn A(p: vec2f) -> vec3f { return textureSampleLevel(texA, samp, p, 0.0).rgb; }
 fn B(p: vec2f) -> vec3f { return textureSampleLevel(texB, samp, p, 0.0).rgb; }
@@ -634,29 +657,75 @@ fn hue(h: f32) -> vec3f {
   return clamp(abs(fract(h + vec3f(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, vec3f(0.0), vec3f(1.0));
 }
 
-fn interp(p: vec2f, t: f32) -> vec3f {
+// motion of a mid-time point towards the nearer frame (f0 for t < 0.5, f1 after)
+fn toward(f: vec4f, lo: bool) -> vec2f { return select(f.zw, f.xy, lo); }
+
+// RIFE result (flow fT, mask mT) for timestep tau, drawn at time t. A point q there is at q + f0 in
+// A and q + f1 in B, and (piecewise linear) at q + (tau - t) / tau * f0 before tau,
+// q + (t - tau) / (1 - tau) * f1 after. Find the q that is at p at time t: q + c * toward(q) = p.
+// The fixed point is iterated from three starts (no motion, and one step along / against the motion
+// at p); the candidate that lands closest to p wins, where a point RIFE's mask says is only visible
+// in the farther frame (it appears from behind something) loses against one that is visible on our
+// side. Returns (colour, cost); cost = how far (model pixels) the best candidate misses p.
+fn rifeAt(p: vec2f, t: f32, tau: f32, fT: texture_2d<f32>, mT: texture_2d<f32>) -> vec4f {
+  let lo = t < tau;
+  let c = select((t - tau) / (1.0 - tau), (tau - t) / tau, lo);
+  // t mapped so that tau -> 0.5 (RIFE's own blend at t = tau), 0 -> 0, 1 -> 1
+  let s = select(0.5 + 0.5 * (t - tau) / (1.0 - tau), 0.5 * t / tau, lo);
+  let px = vec2f(textureDimensions(fT));
+  let m0 = c * toward(textureSampleLevel(fT, samp, p, 0.0), lo);
+  var starts = array<vec2f, 3>(p, p - m0, p + m0);
   var q = p;
-  if (t < 0.5) {
-    let c = 1.0 - 2.0 * t;
-    for (var i = 0; i < 4; i++) { q = p - c * Fl(q).xy; }
-  } else {
-    let c = 2.0 * t - 1.0;
-    for (var i = 0; i < 4; i++) { q = p - c * Fl(q).zw; }
+  var best = 1e9;
+  for (var k = 0; k < 3; k++) {
+    var r = starts[k];
+    for (var i = 0; i < 5; i++) { r = p - c * toward(textureSampleLevel(fT, samp, r, 0.0), lo); }
+    let res = length((r + c * toward(textureSampleLevel(fT, samp, r, 0.0), lo) - p) * px);
+    let m = textureSampleLevel(mT, samp, r, 0.0).r;
+    let hidden = smoothstep(0.75, 0.95, select(m, 1.0 - m, lo)) * c;
+    let cost = res + 3.0 * hidden;
+    if (cost < best) { best = cost; q = r; }
   }
-  let f = Fl(q);
-  let mk = Mk(q);
+  let f = textureSampleLevel(fT, samp, q, 0.0);
+  let m = textureSampleLevel(mT, samp, q, 0.0).r;
   let a = A(q + f.xy);
   let b = B(q + f.zw);
-  let wa = mk.r * (1.0 - t);
-  let wb = (1.0 - mk.r) * t;
-  var col = (wa * a + wb * b) / max(wa + wb, 1e-6);
-  var conf = 1.0 - smoothstep(0.08, 0.25, abs(lum(a) - lum(b)));
+  let wa = m * (1.0 - s);
+  let wb = (1.0 - m) * s;
+  return vec4f((wa * a + wb * b) / max(wa + wb, 1e-6), best);
+}
+
+fn interp(p: vec2f, t: f32) -> vec3f {
+  // From RIFE at t = 0.5 where it extrapolates cleanly (it is RIFE's most accurate timestep); where it
+  // misses, from the extra anchor nearer to t (if bound), which has far less to extrapolate.
+  var r = rifeAt(p, t, 0.5, flowT, maskT);
+  var sel = vec4f(0.0, 1.0, 0.0, 0.0);
+  if (U.hybrid >= 0.0) { sel = textureSampleLevel(selT, samp, p, 0.0); }
+  // half-resolution RIFE where the selection map prefers it (large motion)
+  if (sel.b > 0.002) { r = mix(r, rifeAt(p, t, 0.5, flowH, maskH), sel.b); }
+  if (U.tau != 0.5 && r.w > 0.5) {
+    let rx = rifeAt(p, t, U.tau, flowX, maskX);
+    let w = smoothstep(0.5, 1.5, r.w) * step(rx.w, r.w);
+    r = mix(r, rx, w);
+  }
+  var col = r.rgb;
+  let best = r.w;
+  let f = Fl(p);
+  var conf = 1.0 - smoothstep(0.08, 0.25, abs(lum(A(p + f.xy)) - lum(B(p + f.zw))));
+  let lo = t < 0.5;
+  // No point of either RIFE result lands here: background that is uncovered at time t but hidden at
+  // the RIFE timestep (behind something moving). Fill it from the nearer frame, along block
+  // matching's motion if there.
+  let hole = smoothstep(1.0, 2.5, best);
+  var fill = select(B(p), A(p), lo);
   if (U.hybrid >= 0.0) {
-    let sel = textureSampleLevel(selT, samp, p, 0.0);
+    let bm = bmInterp(p, t).rgb;
+    fill = bm;
     let w = sel.r * U.hybrid;
-    if (w > 0.002) { col = mix(col, bmInterp(p, t).rgb, w); }
+    if (w > 0.002) { col = mix(col, bm, w); }
     conf = sel.g;
   }
+  col = mix(col, fill, hole);
   // Optional artifact masking: where no motion is trusted, show the nearer original frame instead.
   if (U.masking > 0.0) {
     let near = select(B(p), A(p), t < 0.5);
@@ -684,9 +753,10 @@ fn interp(p: vec2f, t: f32) -> vec3f {
       col = mix(vec3f(lum(A(p))), hue(atan2(v.y, v.x) / 6.2831853 + 0.5), m * 0.8);
     }
     case 5u: {
-      // selection map: red = block matching used, blue = low confidence
+      // selection map: red = block matching used, green = half-resolution RIFE used, blue = low confidence
       let s = select(vec4f(0.0, 1.0, 0.0, 0.0), textureSampleLevel(selT, samp, p, 0.0), U.hybrid >= 0.0);
       col = mix(vec3f(lum(A(p)) * 0.6), vec3f(1.0, 0.1, 0.1), s.r);
+      col = mix(col, vec3f(0.1, 1.0, 0.2), s.b);
       col = mix(col, vec3f(0.1, 0.3, 1.0), (1.0 - s.g) * 0.7);
     }
     default: { col = interp(p, t); }

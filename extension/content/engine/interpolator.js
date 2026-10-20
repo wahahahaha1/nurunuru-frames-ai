@@ -11,11 +11,15 @@
   const CHUNK_SHARE = 0.45; // share of a display frame one inference chunk should take
   const MAX_INFLIGHT = 2; // inference submissions the GPU may lag behind before pump() waits
   const MEASURE_EVERY = 8; // every n-th inference job is timed step by step
+  // Extra RIFE timesteps per pair (besides 0.5): output frames are drawn from the nearest one, so
+  // large motion is extrapolated over a quarter of the pair at most instead of half of it.
+  const ANCHORS = [0.25, 0.75];
 
   class Interpolator {
     constructor(device, net, params) {
       this.device = device;
       this.net = net;
+      this.netH = net.sibling('H'); // the same RIFE at half the resolution (large motion)
       this.params = { ...S.TUNING, ...S.PRESETS.standard, ...params };
       const W = S.WGSL;
       const mod = (code, label) => device.createShaderModule({ code, label });
@@ -82,7 +86,7 @@
     jobMs() {
       if (!this.stepMs.size || !this.res) return null;
       let ms = 0;
-      for (const k of this.res.jobKeys) ms += this.stepMs.get(k) || 0;
+      for (const k of this.typicalKeys()) ms += this.stepMs.get(k) || 0;
       return ms;
     }
 
@@ -111,6 +115,7 @@
     setNet(net) {
       if (net === this.net) return;
       this.net = net;
+      this.netH = net.sibling('H');
       if (this.res) {
         const { srcW, srcH } = this.res;
         this.destroyResources();
@@ -139,6 +144,8 @@
       const fh = Math.max(16, Math.round(srcH * fs));
       const { cw: mw, ch: mh, pw, ph } = S.RifeNet.modelSize(srcW, srcH, p.modelWidth, this.net.spec.modulo);
       this.net.configure(mw, mh);
+      const half = S.RifeNet.modelSize(srcW, srcH, Math.round(mw / 2), this.net.spec.modulo);
+      this.netH.configure(half.cw, half.ch);
       const uni = (data) => {
         const b = d.createBuffer({ size: Math.max(16, data.byteLength), usage: BU.UNIFORM | BU.COPY_DST });
         d.queue.writeBuffer(b, 0, data);
@@ -147,6 +154,7 @@
       const ingestScale = fw / srcW;
       const ingestU = uni(new Float32Array([1 / fw, 1 / fh, ingestScale < 0.75 ? 2 : 1, 0]));
       const tensorU = uni(new Uint32Array([mw, mh, pw, ph, Math.max(1, Math.min(4, Math.round(fw / mw))), 0, 0, 0]));
+      const tensorUH = uni(new Uint32Array([half.cw, half.ch, half.pw, half.ph, Math.max(1, Math.min(4, Math.round(fw / half.cw))), 0, 0, 0]));
       const frames = [];
       for (let s = 0; s < RING; s++) {
         const tex = d.createTexture({
@@ -162,6 +170,10 @@
           flow: d.createTexture({ size: [mw, mh], format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
           mask: d.createTexture({ size: [mw, mh], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
           sel: d.createTexture({ size: [mw, mh], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
+          tensorH: d.createBuffer({ size: S.RifeNet.tensorSize(half.pw, half.ph) * 4, usage: BU.STORAGE }),
+          flowH: d.createTexture({ size: [half.cw, half.ch], format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
+          maskH: d.createTexture({ size: [half.cw, half.ch], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
+          featH: false, // Head features of the half-resolution tensor are submitted
           stats: d.createBuffer({ size: 16, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC }),
           id: -1, // sequence number of the frame currently held
           hasPair: false, // RIFE result for (id-1 -> id) is complete
@@ -172,6 +184,28 @@
         fr.flowView = fr.flow.createView();
         fr.maskView = fr.mask.createView();
         fr.selView = fr.sel.createView();
+        fr.flowHView = fr.flowH.createView();
+        fr.maskHView = fr.maskH.createView();
+        fr.tensorHBG = d.createBindGroup({
+          layout: this.tensorPipe.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.samp },
+            { binding: 1, resource: fr.view },
+            { binding: 2, resource: { buffer: fr.tensorH } },
+            { binding: 3, resource: { buffer: tensorUH } },
+          ],
+        });
+        fr.anchors = ANCHORS.map((ts) => {
+          const an = {
+            ts,
+            flow: d.createTexture({ size: [mw, mh], format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
+            mask: d.createTexture({ size: [mw, mh], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
+            ready: false,
+          };
+          an.flowView = an.flow.createView();
+          an.maskView = an.mask.createView();
+          return an;
+        });
         fr.tensorBG = d.createBindGroup({
           layout: this.tensorPipe.getBindGroupLayout(0),
           entries: [
@@ -185,20 +219,43 @@
       }
       this.bm.configure(frames, fw, srcW, srcH);
       const [fsx, fsy] = this.bm.fieldScale();
-      const selectU = uni(new Float32Array([fsx, fsy, mw, mh]));
+      const selectU = uni(new Float32Array([fsx, fsy, mw, mh, 0, 0, 0, 0]));
+      const selectUH = uni(new Float32Array([fsx, fsy, mw, mh, 1, 0, 0, 0]));
       this.jobs = [];
       this.stepMs = new Map();
-      this.res = { srcW, srcH, fw, fh, mw, mh, pw, ph, ingestU, tensorU, selectU, frames, next: 0 };
-      // step keys of a typical job (one Head + the pair), for jobMs()
-      this.res.jobKeys = this.pairSteps(frames[0], frames[1], true).map((st) => st.key);
+      const scratchStats = d.createBuffer({ size: 16, usage: BU.STORAGE });
+      this.res = { srcW, srcH, fw, fh, mw, mh, pw, ph, half, ingestU, tensorU, tensorUH, selectU, selectUH, scratchStats, frames, next: 0, jobKeys: new Map() };
       return true;
     }
 
-    // Steps of the pair (a -> b) after the Head features: block matching (if used), RIFE, selection map.
-    pairSteps(a, b, useBM) {
+    // Step keys of a typical job (one Head + the pair) with the current options, for jobMs().
+    typicalKeys() {
+      const r = this.res;
+      const o = this.options();
+      const opt = `${o.useBM}/${o.useHalf}/${o.useAnchors}`;
+      if (!r.jobKeys.has(opt)) {
+        const heads = [...this.net.headSteps(r.frames[0].tensor), ...(o.useHalf ? this.netH.headSteps(r.frames[0].tensorH) : [])];
+        const steps = [...heads, ...this.pairSteps(r.frames[0], r.frames[1], o)];
+        r.jobKeys.set(opt, steps.map((st) => st.key));
+      }
+      return r.jobKeys.get(opt);
+    }
+
+    // Which parts a job runs with the current parameters: block matching (hybrid), half-resolution
+    // RIFE (multiscale, needs the hybrid's selection map), extra anchors.
+    options() {
+      const useBM = this.params.hybrid !== false;
+      return { useBM, useHalf: useBM && this.params.multiscale !== false, useAnchors: !!this.params.anchors };
+    }
+
+    // Steps of the pair (a -> b) after the Head features: block matching, RIFE at t = 0.5 (full and
+    // half resolution), selection map, then the extra anchor timesteps (each part if used).
+    // steps.mainEnd = index after which the pair can be drawn.
+    pairSteps(a, b, { useBM, useHalf, useAnchors }) {
       const steps = [];
       if (useBM) steps.push(...this.bm.steps(a, b));
       steps.push(...this.net.job(a.tensor, b.tensor, b));
+      if (useHalf) steps.push(...this.netH.job(a.tensorH, b.tensorH, { flowView: b.flowHView, maskView: b.maskHView, stats: this.res.scratchStats }));
       if (useBM) {
         const r = this.res;
         steps.push({
@@ -209,7 +266,7 @@
           bg: this.device.createBindGroup({
             layout: this.selectPipe.getBindGroupLayout(0),
             entries: [
-              { binding: 0, resource: { buffer: r.selectU } },
+              { binding: 0, resource: { buffer: useHalf ? r.selectUH : r.selectU } },
               { binding: 1, resource: this.samp },
               { binding: 2, resource: a.view },
               { binding: 3, resource: b.view },
@@ -218,11 +275,24 @@
               { binding: 6, resource: b.bm.fieldGView },
               { binding: 7, resource: b.selView },
               { binding: 8, resource: b.maskView },
+              { binding: 9, resource: b.flowHView },
+              { binding: 10, resource: b.maskHView },
             ],
           }),
           wg: [Math.ceil(r.mw / 16), Math.ceil(r.mh / 16), 1],
           cost: r.mw * r.mh * 300,
         });
+      }
+      steps.mainEnd = steps.length;
+      if (useAnchors) {
+        for (const an of b.anchors) {
+          const js = this.net.job(a.tensor, b.tensor, { flowView: an.flowView, maskView: an.maskView, stats: this.res.scratchStats }, an.ts);
+          const id = b.id;
+          js[js.length - 1].after = () => {
+            if (b.id === id) an.ready = true;
+          };
+          steps.push(...js);
+        }
       }
       return steps;
     }
@@ -235,11 +305,21 @@
         f.flow.destroy();
         f.mask.destroy();
         f.sel.destroy();
+        f.tensorH.destroy();
+        f.flowH.destroy();
+        f.maskH.destroy();
         f.stats.destroy();
+        for (const an of f.anchors) {
+          an.flow.destroy();
+          an.mask.destroy();
+        }
       }
+      this.res.scratchStats.destroy();
       this.bm.destroyResources();
       this.res.ingestU.destroy();
       this.res.tensorU.destroy();
+      this.res.tensorUH.destroy();
+      this.res.selectUH.destroy();
       this.res.selectU.destroy();
       this.jobs = [];
       this.res = null;
@@ -299,11 +379,14 @@
       f.id = ++this.seq;
       f.hasPair = false;
       f.hasSel = false;
+      f.hasHalf = false;
       f.pairPrevId = -1;
       f.feat = false;
+      f.featH = false;
       f.sameAs = null;
       f.drawId = f.id; // id of the frame that first showed this drawing
       f.pairDrawId = -1;
+      for (const an of f.anchors) an.ready = false;
       const live = !!prev && prev.id > 0 && this.isLive(prev);
       const test = detectDup && live;
       f.dupState = test ? 'unknown' : 'distinct';
@@ -312,6 +395,10 @@
       cp.setPipeline(this.tensorPipe);
       cp.setBindGroup(0, f.tensorBG);
       cp.dispatchWorkgroups(Math.ceil(r.pw / 16), Math.ceil(r.ph / 16));
+      if (this.options().useHalf) {
+        cp.setBindGroup(0, f.tensorHBG);
+        cp.dispatchWorkgroups(Math.ceil(r.half.pw / 16), Math.ceil(r.half.ph / 16));
+      }
       this.bm.encodeLuma(cp, f);
       if (test) this.bm.encodeDiff(cp, prev, f);
       cp.end();
@@ -344,13 +431,22 @@
     // Steps of a job, built when it starts: Head features of a and b where missing, then the pair.
     startJob(job) {
       const steps = [];
+      const o = this.options();
       for (const f of [job.a, job.b]) {
-        if (f.feat) continue;
-        steps.push(...this.net.headSteps(f.tensor));
-        job.marks.push([steps.length, f]); // features of f are submitted once steps[0, n) are
+        if (!f.feat) {
+          steps.push(...this.net.headSteps(f.tensor));
+          job.marks.push([steps.length, f, 'feat']); // features of f are submitted once steps[0, n) are
+        }
+        if (o.useHalf && !f.featH) {
+          steps.push(...this.netH.headSteps(f.tensorH));
+          job.marks.push([steps.length, f, 'featH']);
+        }
       }
-      job.useBM = this.params.hybrid !== false;
-      steps.push(...this.pairSteps(job.a, job.b, job.useBM));
+      job.useBM = o.useBM;
+      job.useHalf = o.useHalf;
+      const ps = this.pairSteps(job.a, job.b, o);
+      job.mainEnd = steps.length + ps.mainEnd;
+      steps.push(...ps);
       job.steps = steps;
       if (job.measure) job.ms = new Array(steps.length).fill(0);
     }
@@ -437,7 +533,7 @@
       }
       cp.end();
       job.next = last;
-      for (const [n, f] of job.marks) if (last >= n) f.feat = true;
+      for (const [n, f, flag] of job.marks) if (last >= n) f[flag] = true;
       let read = null;
       if (timed) {
         const size = 16 * (last - first);
@@ -447,13 +543,16 @@
         enc.copyBufferToBuffer(resolve, 0, read, 0, size);
         read.resolve = resolve;
       }
-      if (last === steps.length) {
+      if (!job.mainDone && last >= job.mainEnd) {
+        // the pair can be drawn (extra anchors may still follow)
+        job.mainDone = true;
         job.b.hasPair = true;
         job.b.hasSel = job.useBM;
+        job.b.hasHalf = job.useHalf;
         job.b.pairPrevId = job.aId;
         job.b.pairDrawId = job.a.drawId;
-        this.jobs.shift();
       }
+      if (last === steps.length) this.jobs.shift();
       d.queue.submit([enc.finish()]);
       const done = () => {
         if (--job.pending === 0 && job.next === steps.length && job.ms) this.noteJobTimes(steps, job.ms);
@@ -522,6 +621,11 @@
       // no inference result (yet): show the nearer frame rather than a ghosting blend
       if (!paired && (mode === 0 || mode >= 4)) mode = b === a || t < 0.5 ? 1 : 2;
       const sel = paired && b.hasSel;
+      // extra RIFE anchor nearer to t than 0.5 (ready, same pair), used where 0.5 extrapolates badly
+      let anchor = null;
+      if (paired) {
+        for (const an of b.anchors) if (an.ready && Math.abs(an.ts - t) < Math.abs(0.5 - t) && (!anchor || Math.abs(an.ts - t) < Math.abs(anchor.ts - t))) anchor = an;
+      }
       const buf = new ArrayBuffer(64);
       const f = new Float32Array(buf);
       const u = new Uint32Array(buf);
@@ -533,6 +637,7 @@
       f[9] = p.sceneFrac;
       f[10] = opts.split || 0;
       f[11] = sel ? (opts.hybrid ?? 1) : -1;
+      f[12] = anchor ? anchor.ts : 0.5;
       d.queue.writeBuffer(this.renderU, 0, buf);
       const pipe = this.renderPipe(format);
       const zero = this.zeroTex.createView();
@@ -549,6 +654,10 @@
           { binding: 7, resource: sel ? b.bm.fieldFView : zero },
           { binding: 8, resource: sel ? b.bm.fieldGView : zero },
           { binding: 9, resource: sel ? b.selView : zero },
+          { binding: 10, resource: anchor ? anchor.flowView : zero },
+          { binding: 11, resource: anchor ? anchor.maskView : zero },
+          { binding: 12, resource: sel && b.hasHalf ? b.flowHView : zero },
+          { binding: 13, resource: sel && b.hasHalf ? b.maskHView : zero },
         ],
       });
       const enc = d.createCommandEncoder();

@@ -45,7 +45,7 @@
       $(id).value = settings[id];
       $(id + 'Out').textContent = fmt[id](settings[id]);
     }
-    for (const id of ['hybrid', 'anime', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).checked = settings[id];
+    for (const id of ['hybrid', 'anchors', 'anime', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).checked = settings[id];
   }
 
   function save(patch) {
@@ -65,7 +65,7 @@
     $(id).oninput = (e) => ($(id + 'Out').textContent = fmt[id](+e.target.value));
     $(id).onchange = (e) => save({ [id]: +e.target.value });
   }
-  for (const id of ['hybrid', 'anime', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).onchange = (e) => save({ [id]: e.target.checked });
+  for (const id of ['hybrid', 'anchors', 'anime', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).onchange = (e) => save({ [id]: e.target.checked });
 
   $('capture').onclick = async () => {
     try {

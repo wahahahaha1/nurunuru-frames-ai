@@ -96,6 +96,7 @@
       if (!this.engine) return;
       const old = this.engine.res;
       const params = S.engineParams({ ...this.settings, preset: this.effectivePreset() });
+      if (this.perf.noAnchors) params.anchors = false;
       this.engine.setParams(params);
       if (this.engine.res !== old) this.flush();
       if (params.model !== this.engine.net.model) {
@@ -161,7 +162,12 @@
       p.starve = 0;
       const cur = this.effectivePreset();
       const srcFps = this.srcRate();
-      if (cur !== 'fast') {
+      if (this.engine.params.anchors && !p.noAnchors) {
+        p.noAnchors = true;
+        p.me = null;
+        p.note = 'GPU 負荷が高いため「大きな動きを高精度に」を自動でオフにしました';
+        this.applyEngineParams();
+      } else if (cur !== 'fast') {
         p.presetCap = PRESET_ORDER[PRESET_ORDER.indexOf(cur) - 1];
         p.me = null;
         p.render = null;

@@ -199,6 +199,15 @@
       this.wbuf = d.createBuffer({ size: data.byteLength, usage: BU.STORAGE | BU.COPY_DST });
       d.queue.writeBuffer(this.wbuf, 0, data);
       this.res = null;
+      this.keyPrefix = '';
+    }
+
+    // A second network sharing weights and pipelines, with its own size and scratch buffers
+    // (step keys prefixed with `prefix` so their timings are kept apart).
+    sibling(prefix) {
+      const n = Object.create(RifeNet.prototype);
+      Object.assign(n, this, { res: null, keyPrefix: prefix, parent: this });
+      return n;
     }
 
     // Picture size (cw x ch, width about `width`, sides multiples of 8) and padded model input size.
@@ -281,12 +290,12 @@
         const split = c.ks > 1;
         const u = uni(new Uint32Array([L.cin, L.cout, iw, ih, ow, oh, L.wOff, L.bOff, resBuf ? 1 : 0, 1, c.ncog, c.cinPer, split ? 1 : 0, 0, 0, 0]));
         const kind = stride === 1 ? 'conv1' : 'conv2';
-        const conv = { key, pipe, block, kind, bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, split ? bufs.part : outBuf]), wg: c.wg, cost: L.cin * L.cout * 9 * ow * oh };
+        const conv = { key: this.keyPrefix + key, pipe, block, kind, bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, split ? bufs.part : outBuf]), wg: c.wg, cost: L.cin * L.cout * 9 * ow * oh };
         if (!split) return [conv];
         const n = L.cout * ow * oh;
         const ru = uni(new Uint32Array([n, ow * oh, c.ks, resBuf ? 1 : 0, L.bOff, 1, 0, 0]));
         const red = this.pipes.reduce;
-        return [conv, { key: key + 'r', pipe: red, block, kind, bg: bg(red, [ru, bufs.part, this.wbuf, resBuf || bufs.part, outBuf]), wg: [Math.ceil(n / 256), 1, 1], cost: n * c.ks }];
+        return [conv, { key: this.keyPrefix + key + 'r', pipe: red, block, kind, bg: bg(red, [ru, bufs.part, this.wbuf, resBuf || bufs.part, outBuf]), wg: [Math.ceil(n / 256), 1, 1], cost: n * c.ks }];
       };
       const steps = []; // static steps (block inputs are filled per job)
       for (const p of plan) {
@@ -305,7 +314,7 @@
         const dp = deconvPlan(L.deconv.cin, fw, fh);
         const du = uni(new Uint32Array([L.deconv.cin, fw, fh, L.deconv.wOff, L.deconv.bOff, dp.cinPer, 0, 0]));
         steps.push({
-          key: `b${b}d`,
+          key: `${this.keyPrefix}b${b}d`,
           pipe: this.pipes.deconv,
           block: b,
           kind: 'deconv',
@@ -317,7 +326,7 @@
         new Uint32Array(abuf).set([pw, ph, fw * 4, fh * 4, 0, b === 0 ? 1 : 0, dp.ks, NC]);
         new Float32Array(abuf)[4] = p.scale;
         steps.push({
-          key: `b${b}a`,
+          key: `${this.keyPrefix}b${b}a`,
           pipe: this.pipes.accum,
           block: b,
           kind: 'other',
@@ -325,10 +334,7 @@
           wg: [Math.ceil(pw / 16), Math.ceil(ph / 16), 1],
           cost: pw * ph * NC * 4 * dp.ks,
         });
-        const pb = new ArrayBuffer(32);
-        new Uint32Array(pb).set([pw, ph, p.bw, p.bh, 0, b === 0 ? 1 : 0, 0, 0]);
-        new Float32Array(pb)[4] = p.scale;
-        p.prepU = uni(pb);
+        p.prepU = new Map(); // timestep -> uniform buffer (made on first use)
         p.prepCost = p.bw * p.bh * (b === 0 ? 30 : 400);
       }
       this.res = {
@@ -355,7 +361,7 @@
       const D = this.head.deconv;
       const eu = r.uni(new Uint32Array([D.cin, hw, hh, D.wOff, D.bOff, 3 * pw * ph, 0, 0]));
       steps.push({
-        key: 'h3',
+        key: this.keyPrefix + 'h3',
         pipe: this.pipes.deconvPlain,
         block: -1,
         kind: 'deconv',
@@ -367,24 +373,32 @@
       return steps;
     }
 
-    // Step list for the pair (tensors a -> b, Head features already computed); the last step writes
-    // the frame's flow / mask textures and scene statistics.
-    job(tensorA, tensorB, out) {
+    // Step list for the pair (tensors a -> b, Head features already computed) at timestep ts; the
+    // last step writes out's flow / mask textures and scene statistics.
+    job(tensorA, tensorB, out, ts = 0.5) {
       const r = this.res;
       const steps = r.steps.slice();
       for (const p of r.plan) {
+        if (!p.prepU.has(ts)) {
+          const pb = new ArrayBuffer(32);
+          new Uint32Array(pb).set([r.pw, r.ph, p.bw, p.bh, 0, p.i === 0 ? 1 : 0, 0, 0]);
+          const f = new Float32Array(pb);
+          f[4] = p.scale;
+          f[6] = ts;
+          p.prepU.set(ts, r.uni(pb));
+        }
         steps[p.prepIndex] = {
-          key: `b${p.i}p`,
+          key: `${this.keyPrefix}b${p.i}p`,
           pipe: this.pipes.prep,
           block: p.i,
           kind: 'other',
-          bg: r.bg(this.pipes.prep, [p.prepU, tensorA, tensorB, r.bufs.fm, r.bufs.x]),
+          bg: r.bg(this.pipes.prep, [p.prepU.get(ts), tensorA, tensorB, r.bufs.fm, r.bufs.x]),
           wg: [Math.ceil(p.bw / 16), Math.ceil(p.bh / 16), 1],
           cost: p.prepCost,
         };
       }
       steps.push({
-        key: 'pack',
+        key: this.keyPrefix + 'pack',
         pipe: this.pipes.pack,
         block: r.plan.length - 1,
         kind: 'other',
@@ -404,7 +418,7 @@
 
     destroy() {
       this.destroyResources();
-      this.wbuf.destroy();
+      if (!this.parent) this.wbuf.destroy();
     }
   }
 
