@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>NuruNuru Frames AI ベンチマーク</title>
+<link rel="stylesheet" href="bench.css">
+</head>
+<body>
+<main>
+  <h1>NuruNuru Frames AI ベンチマーク</h1>
+  <p class="lead">この PC の GPU で、AI（RIFE）の推論 1 回にかかる時間をプリセットごとに測ります。1080p（16:9）の動画を想定しています。測定中は動画の再生などを止めてください。</p>
+  <button id="run">測定する</button>
+  <div id="gpu" class="muted"></div>
+  <table id="result" hidden>
+    <thead>
+      <tr><th>プリセット</th><th>推論解像度</th><th>推論 1 回</th><th>24fps 動画</th><th>30fps 動画</th><th>60fps 動画</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <p id="note" class="muted" hidden>「24fps 動画」などの列は、その動画を補間するときに推論が GPU 時間の何 % を使うかの目安です（描画のぶんは含みません）。拡張機能は 70% を超えるとプリセットを自動で下げます。</p>
+  <h2 id="bdTitle" hidden>内訳（標準プリセット）</h2>
+  <table id="breakdown" hidden><tbody></tbody></table>
+  <pre id="log"></pre>
+</main>
+<script src="../content/engine/gpu.js"></script>
+<script src="../content/engine/shaders.js"></script>
+<script src="../content/engine/rife.js"></script>
+<script src="bench.js"></script>
+</body>
+</html>

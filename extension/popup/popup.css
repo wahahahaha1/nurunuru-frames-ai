@@ -3,7 +3,7 @@
   --panel: #1f232a;
   --text: #e6e8ec;
   --muted: #9aa3b2;
-  --accent: #3fa7ff;
+  --accent: #b061ff;
   --line: #2c313a;
 }
 * { box-sizing: border-box; }
@@ -24,6 +24,7 @@ header {
 h1 { font-size: 15px; margin: 0; letter-spacing: .02em; }
 section { padding: 10px 14px; border-bottom: 1px solid var(--line); }
 footer { padding: 8px 14px 12px; color: var(--muted); font-size: 11px; }
+footer a { color: var(--accent); }
 .row { display: flex; align-items: center; justify-content: space-between; min-height: 28px; }
 .label { color: var(--muted); margin: 6px 0 2px; display: flex; justify-content: space-between; }
 output { color: var(--text); font-variant-numeric: tabular-nums; }

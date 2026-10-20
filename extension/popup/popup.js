@@ -67,6 +67,11 @@
   }
   for (const id of ['audioSync', 'demo', 'showVectors', 'osd']) $(id).onchange = (e) => save({ [id]: e.target.checked });
 
+  $('bench').onclick = (e) => {
+    e.preventDefault();
+    chrome.tabs.create({ url: chrome.runtime.getURL('bench/bench.html') });
+  };
+
   const audioText = { waiting: 'ページをクリックすると有効', idle: '待機', failed: '使用不可', off: 'OFF' };
 
   async function refreshStatus() {
