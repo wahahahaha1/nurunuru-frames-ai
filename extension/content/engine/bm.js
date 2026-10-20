@@ -386,7 +386,31 @@ var<workgroup> part: array<f32, 64>;
   }
 }
 `;
-  const DIFF_THRESHOLD = 0.012; // mean |luma difference| of an 8x8 block (0..1) that counts as a change
+  const DIFF_THRESHOLD = 0.012;
+
+  // Mean luma of a frame (coarse level): [sum * 256, pixel count], for brightness changes (fades).
+  const mean = /* wgsl */ `
+struct MU { w: u32, h: u32, pad0: u32, pad1: u32 };
+@group(0) @binding(0) var<uniform> U: MU;
+@group(0) @binding(1) var<storage, read> lum: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outM: array<atomic<u32>, 2>;
+
+var<workgroup> part: array<f32, 256>;
+
+@compute @workgroup_size(16, 16) fn main(@builtin(global_invocation_id) g: vec3u, @builtin(local_invocation_index) tid: u32) {
+  var v = 0.0;
+  var n = 0u;
+  if (g.x < U.w && g.y < U.h) { v = lum[g.y * U.w + g.x]; n = 1u; }
+  part[tid] = v;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s = s >> 1u) {
+    if (tid < s) { part[tid] += part[tid + s]; }
+    workgroupBarrier();
+  }
+  if (tid == 0u) { atomicAdd(&outM[0], u32(part[0] * 256.0)); }
+  if (n == 1u) { atomicAdd(&outM[1], 1u); }
+}
+`; // mean |luma difference| of an 8x8 block (0..1) that counts as a change
 
   class BlockMatcher {
     constructor(device, sampler) {
@@ -400,6 +424,7 @@ var<workgroup> part: array<f32, 64>;
       this.mePipe = comp(motion, 'bm-motion');
       this.finPipe = comp(finalize, 'bm-finalize');
       this.diffPipe = comp(diff, 'bm-diff');
+      this.meanPipe = comp(mean, 'bm-mean');
       this.zeroBuf = d.createBuffer({ size: 64, usage: BU.STORAGE });
       this.res = null;
     }
@@ -460,6 +485,7 @@ var<workgroup> part: array<f32, 64>;
       new Uint32Array(xbuf).set([lw[dl], lh[dl]]);
       new Float32Array(xbuf)[2] = DIFF_THRESHOLD;
       const diffU = uni(xbuf);
+      const meanU = uni(new Uint32Array([lw[dl], lh[dl], 0, 0]));
       for (const fr of frames) {
         const bm = {
           luma: lw.map((w, k) => d.createBuffer({ size: w * lh[k] * 4, usage: BU.STORAGE })),
@@ -470,6 +496,7 @@ var<workgroup> part: array<f32, 64>;
           hasPair: false, // fields for (id-1 -> id) are submitted
           pairPrevId: -1,
           diff: d.createBuffer({ size: 16, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC }),
+          mean: d.createBuffer({ size: 16, usage: BU.STORAGE | BU.COPY_DST }), // [luma sum * 256, count]
         };
         bm.fieldFView = bm.fieldF.createView();
         bm.fieldGView = bm.fieldG.createView();
@@ -495,6 +522,14 @@ var<workgroup> part: array<f32, 64>;
             })
           );
         }
+        bm.meanBG = d.createBindGroup({
+          layout: this.meanPipe.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: meanU } },
+            { binding: 1, resource: { buffer: bm.luma[dl] } },
+            { binding: 2, resource: { buffer: bm.mean } },
+          ],
+        });
         fr.bm = bm;
       }
       this.res = { mw, mh, levels, lw, lh, nbx, nby, meU, finU, diffU, dl, uniforms, frames };
@@ -549,6 +584,7 @@ var<workgroup> part: array<f32, 64>;
         bm.fieldF.destroy();
         bm.fieldG.destroy();
         bm.diff.destroy();
+        bm.mean.destroy();
         for (const b of [...bm.luma, ...bm.vecF, ...bm.vecG]) b.destroy();
         fr.bm = null;
       }
@@ -561,7 +597,12 @@ var<workgroup> part: array<f32, 64>;
       this.zeroBuf.destroy();
     }
 
-    // Build the luma pyramid of a frame (inside a compute pass).
+    // Build the luma pyramid and mean luma of a frame (inside a compute pass; clear fr.bm.mean before
+    // the pass with clearMean).
+    clearMean(enc, fr) {
+      enc.clearBuffer(fr.bm.mean);
+    }
+
     encodeLuma(cp, fr) {
       const r = this.res;
       fr.bm.hasPair = false;
@@ -574,6 +615,9 @@ var<workgroup> part: array<f32, 64>;
         cp.setBindGroup(0, fr.bm.downBG[k]);
         cp.dispatchWorkgroups(Math.ceil(r.lw[k] / 16), Math.ceil(r.lh[k] / 16));
       }
+      cp.setPipeline(this.meanPipe);
+      cp.setBindGroup(0, fr.bm.meanBG);
+      cp.dispatchWorkgroups(Math.ceil(r.lw[r.dl] / 16), Math.ceil(r.lh[r.dl] / 16));
     }
 
     // Steps estimating both fields of the pair (a -> b); the temporal predictor is a's pair, if valid.

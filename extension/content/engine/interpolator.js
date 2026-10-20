@@ -254,7 +254,8 @@
     pairSteps(a, b, { useBM, useHalf, useAnchors }) {
       const steps = [];
       if (useBM) steps.push(...this.bm.steps(a, b));
-      steps.push(...this.net.job(a.tensor, b.tensor, b));
+      // with the selection map, scene statistics come from it (brightness-compensated)
+      steps.push(...this.net.job(a.tensor, b.tensor, useBM ? { flowView: b.flowView, maskView: b.maskView, stats: this.res.scratchStats } : b));
       if (useHalf) steps.push(...this.netH.job(a.tensorH, b.tensorH, { flowView: b.flowHView, maskView: b.maskHView, stats: this.res.scratchStats }));
       if (useBM) {
         const r = this.res;
@@ -277,6 +278,9 @@
               { binding: 8, resource: b.maskView },
               { binding: 9, resource: b.flowHView },
               { binding: 10, resource: b.maskHView },
+              { binding: 11, resource: { buffer: a.bm.mean } },
+              { binding: 12, resource: { buffer: b.bm.mean } },
+              { binding: 13, resource: { buffer: b.stats } },
             ],
           }),
           wg: [Math.ceil(r.mw / 16), Math.ceil(r.mh / 16), 1],
@@ -391,6 +395,7 @@
       const test = detectDup && live;
       f.dupState = test ? 'unknown' : 'distinct';
       if (test) this.bm.clearDiff(enc, f);
+      this.bm.clearMean(enc, f);
       const cp = enc.beginComputePass();
       cp.setPipeline(this.tensorPipe);
       cp.setBindGroup(0, f.tensorBG);
@@ -658,6 +663,8 @@
           { binding: 11, resource: anchor ? anchor.maskView : zero },
           { binding: 12, resource: sel && b.hasHalf ? b.flowHView : zero },
           { binding: 13, resource: sel && b.hasHalf ? b.maskHView : zero },
+          { binding: 14, resource: { buffer: a.bm.mean } },
+          { binding: 15, resource: { buffer: b.bm.mean } },
         ],
       });
       const enc = d.createCommandEncoder();

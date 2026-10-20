@@ -498,6 +498,25 @@ fn lumAt(buf: u32, p: vec2f) -> f32 {
 }
 `;
 
+  // Brightness changes (fades, flashes): the mean luma ratio k = B / A of the pair. Samples of A and B
+  // are scaled to the brightness expected at time t (linear in between: A * (1 + (k - 1) t)) before
+  // they are compared or blended. Needs bindings meanA / meanB and sets gA / gB.
+  const gain = /* wgsl */ `
+var<private> gA: f32 = 1.0;
+var<private> gB: f32 = 1.0;
+fn setGain(t: f32) {
+  let ma = f32(meanA[0]) / max(f32(meanA[1]), 1.0);
+  let mb = f32(meanB[0]) / max(f32(meanB[1]), 1.0);
+  var k = clamp((mb + 1.0) / (ma + 1.0), 0.33, 3.0); // (+1: sums are luma * 256, keeps black stable)
+  // ignore changes within 1 % (content moving in and out at the edges shifts the mean a little)
+  k = 1.0 + sign(k - 1.0) * max(abs(k - 1.0) - 0.01, 0.0);
+  gA = 1.0 + (k - 1.0) * t;
+  gB = gA / k;
+}
+fn Ag(p: vec2f) -> vec3f { return A(p) * gA; }
+fn Bg(p: vec2f) -> vec3f { return B(p) * gB; }
+`;
+
   // Block matching at phase t (NuruNuru Frames' renderer): the forward / backward block fields are
   // aligned to t by fixed-point iteration, both frames are warped along each and the two
   // predictions are weighted by how well they agree; where neither agrees (occlusion) the nearer,
@@ -513,10 +532,10 @@ fn bmInterp(p: vec2f, t: f32) -> vec4f {
   for (var i = 0; i < 3; i++) { w = Gb(p - (1.0 - t) * w).xy; }
   let fq = Fb(p - t * v);
   let gq = Gb(p - (1.0 - t) * w);
-  let a0 = A(p - t * v);
-  let b0 = B(p + (1.0 - t) * v);
-  let b1 = B(p - (1.0 - t) * w);
-  let a1 = A(p + t * w);
+  let a0 = Ag(p - t * v);
+  let b0 = Bg(p + (1.0 - t) * v);
+  let b1 = Bg(p - (1.0 - t) * w);
+  let a1 = Ag(p + t * w);
   let pF = abs(lum(a0) - lum(b0));
   let pG = abs(lum(a1) - lum(b1));
   let eF = pF + 0.5 * fq.z;
@@ -551,13 +570,18 @@ struct SU { fieldScale: vec2f, size: vec2f, useHalf: f32, pad0: f32, pad1: f32, 
 @group(0) @binding(8) var maskT: texture_2d<f32>;
 @group(0) @binding(9) var flowH: texture_2d<f32>;
 @group(0) @binding(10) var maskH: texture_2d<f32>;
+@group(0) @binding(11) var<storage, read> meanA: array<u32, 2>;
+@group(0) @binding(12) var<storage, read> meanB: array<u32, 2>;
+@group(0) @binding(13) var<storage, read_write> stats: array<atomic<u32>, 4>;
+${gain}
+var<workgroup> cnt: array<atomic<u32>, 2>;
 
 // photometric disagreement of a RIFE result's two warps at p: (error not counted where its mask
 // picks one frame only (occlusion: the other warp is expected to disagree), one-sidedness, raw error)
 fn rifeErr(p: vec2f, fT: texture_2d<f32>, mT: texture_2d<f32>) -> vec3f {
   let f = textureSampleLevel(fT, samp, p, 0.0);
   let side = abs(2.0 * textureSampleLevel(mT, samp, p, 0.0).r - 1.0);
-  let e = abs(lum(A(p + f.xy)) - lum(B(p + f.zw)));
+  let e = abs(lum(Ag(p + f.xy)) - lum(Bg(p + f.zw)));
   return vec3f(e * (1.0 - side), side, e);
 }
 
@@ -565,8 +589,24 @@ fn A(p: vec2f) -> vec3f { return textureSampleLevel(texA, samp, p, 0.0).rgb; }
 fn B(p: vec2f) -> vec3f { return textureSampleLevel(texB, samp, p, 0.0).rgb; }
 fn lum(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
 ${bmInterp}
-@compute @workgroup_size(16, 16) fn main(@builtin(global_invocation_id) g: vec3u) {
-  if (f32(g.x) >= U.size.x || f32(g.y) >= U.size.y) { return; }
+@compute @workgroup_size(16, 16) fn main(@builtin(global_invocation_id) g: vec3u, @builtin(local_invocation_index) tid: u32) {
+  // scene-change statistics (brightness-compensated): share of pixels whose two warps disagree
+  setGain(0.5);
+  if (tid < 2u) { atomicStore(&cnt[tid], 0u); }
+  workgroupBarrier();
+  let inside = f32(g.x) < U.size.x && f32(g.y) < U.size.y;
+  if (inside && (g.x & 1u) == 0u && (g.y & 1u) == 0u) {
+    let pc = (vec2f(g.xy) + 0.5) / U.size;
+    let fc = textureSampleLevel(flowT, samp, pc, 0.0);
+    atomicAdd(&cnt[1], 1u);
+    if (abs(lum(Ag(pc + fc.xy)) - lum(Bg(pc + fc.zw))) > 0.1) { atomicAdd(&cnt[0], 1u); }
+  }
+  workgroupBarrier();
+  if (tid == 0u) {
+    atomicAdd(&stats[0], atomicLoad(&cnt[0]));
+    atomicAdd(&stats[1], atomicLoad(&cnt[1]));
+  }
+  if (!inside) { return; }
   let p0 = (vec2f(g.xy) + 0.5) / U.size;
   var eA = 0.0;
   var eAraw = 0.0;
@@ -666,6 +706,8 @@ struct RU {
 @group(0) @binding(11) var maskX: texture_2d<f32>;
 @group(0) @binding(12) var flowH: texture_2d<f32>;
 @group(0) @binding(13) var maskH: texture_2d<f32>;
+@group(0) @binding(14) var<storage, read> meanA: array<u32, 2>;
+@group(0) @binding(15) var<storage, read> meanB: array<u32, 2>;
 
 fn A(p: vec2f) -> vec3f { return textureSampleLevel(texA, samp, p, 0.0).rgb; }
 fn B(p: vec2f) -> vec3f { return textureSampleLevel(texB, samp, p, 0.0).rgb; }
@@ -698,6 +740,7 @@ fn sharp(tex: texture_2d<f32>, uv: vec2f) -> vec3f {
 fn Fl(p: vec2f) -> vec4f { return textureSampleLevel(flowT, samp, p, 0.0); }
 fn Mk(p: vec2f) -> vec4f { return textureSampleLevel(maskT, samp, p, 0.0); }
 fn lum(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
+${gain}
 ${bmInterp}
 fn hue(h: f32) -> vec3f {
   return clamp(abs(fract(h + vec3f(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, vec3f(0.0), vec3f(1.0));
@@ -736,8 +779,8 @@ fn rifeAt(p: vec2f, t: f32, tau: f32, fT: texture_2d<f32>, mT: texture_2d<f32>) 
   }
   let f = textureSampleLevel(fT, samp, q, 0.0);
   let m = textureSampleLevel(mT, samp, q, 0.0).r;
-  let a = sharp(texA, q + f.xy);
-  let b = sharp(texB, q + f.zw);
+  let a = sharp(texA, q + f.xy) * gA;
+  let b = sharp(texB, q + f.zw) * gB;
   // RIFE's blend weight m, shifted towards the nearer frame (squared time weights: equal at s = 0.5,
   // so t = tau is RIFE's own output; where m is one-sided (occlusion) it still wins)
   let wa = m * (1.0 - s) * (1.0 - s);
@@ -761,13 +804,13 @@ fn interp(p: vec2f, t: f32) -> vec3f {
   var col = r.rgb;
   let best = r.w;
   let f = Fl(p);
-  var conf = 1.0 - smoothstep(0.08, 0.25, abs(lum(A(p + f.xy)) - lum(B(p + f.zw))));
+  var conf = 1.0 - smoothstep(0.08, 0.25, abs(lum(Ag(p + f.xy)) - lum(Bg(p + f.zw))));
   let lo = t < 0.5;
   // No point of either RIFE result lands here: background that is uncovered at time t but hidden at
   // the RIFE timestep (behind something moving). Fill it from the nearer frame, along block
   // matching's motion if there.
   let hole = smoothstep(1.0, 2.5, best);
-  var fill = select(B(p), A(p), lo);
+  var fill = select(Bg(p), Ag(p), lo);
   if (U.hybrid >= 0.0) {
     let bm = bmInterp(p, t).rgb;
     fill = bm;
@@ -778,7 +821,7 @@ fn interp(p: vec2f, t: f32) -> vec3f {
   col = mix(col, fill, hole);
   // Optional artifact masking: where no motion is trusted, show the nearer original frame instead.
   if (U.masking > 0.0) {
-    let near = select(B(p), A(p), t < 0.5);
+    let near = select(Bg(p), Ag(p), t < 0.5);
     col = mix(col, near, U.masking * (1.0 - conf));
   }
   return col;
@@ -788,6 +831,7 @@ fn interp(p: vec2f, t: f32) -> vec3f {
   let p = (in.pos.xy - U.rect.xy) / U.rect.zw;
   if (p.x < 0.0 || p.y < 0.0 || p.x > 1.0 || p.y > 1.0) { return vec4f(0.0); }
   let t = U.t;
+  setGain(t);
   var mode = U.mode;
   if (mode == 0u && stats[1] > 0u && f32(stats[0]) > U.sceneFrac * f32(stats[1])) { mode = select(2u, 1u, t < 0.5); }
   if (mode == 0u && in.pos.x < U.split) { mode = 1u; }
