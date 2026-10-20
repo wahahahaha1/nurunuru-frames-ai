@@ -17,9 +17,36 @@
   const ALIGN = 32;
 
   const CONV_CFG = {
-    1: { stride: 1, tx: 16, ty: 8, px: 2, py: 2, ci: 4 },
-    2: { stride: 2, tx: 8, ty: 8, px: 2, py: 2, ci: 2 },
+    conv1: { stride: 1, tx: 16, ty: 8, px: 2, py: 2, ci: 4 },
+    conv1s: { stride: 1, tx: 8, ty: 8, px: 1, py: 1, ci: 8 }, // small feature maps (coarse blocks)
+    conv2: { stride: 2, tx: 8, ty: 8, px: 2, py: 2, ci: 2 },
   };
+  // Workgroups a dispatch should offer to fill a large GPU; small layers get split-K below this.
+  const TARGET_WG = 512;
+
+  // Shader variant, workgroup grid and split-K factor of a 3x3 conv layer.
+  function convPlan(L, stride, ow, oh) {
+    const tiles = (cfg) => Math.ceil(ow / (cfg.tx * cfg.px)) * Math.ceil(oh / (cfg.ty * cfg.py));
+    const ncog = L.cout / 16;
+    let key = stride === 1 ? 'conv1' : 'conv2';
+    if (stride === 1 && tiles(CONV_CFG.conv1) * ncog < TARGET_WG / 2) key = 'conv1s';
+    const cfg = CONV_CFG[key];
+    const wgs = tiles(cfg) * ncog;
+    let ks = Math.max(1, Math.min(8, Math.floor(L.cin / (cfg.ci * 4)), Math.ceil(TARGET_WG / wgs)));
+    const cinPer = Math.ceil(L.cin / ks / cfg.ci) * cfg.ci;
+    ks = Math.ceil(L.cin / cinPer);
+    const wg = [Math.ceil(ow / (cfg.tx * cfg.px)), Math.ceil(oh / (cfg.ty * cfg.py)), ncog * ks];
+    return { key, ks, cinPer, ncog, wg };
+  }
+
+  // Split-K factor of a deconv (output 4fw x 4fh, one thread per pixel).
+  function deconvPlan(cin, fw, fh) {
+    const wgs = Math.ceil((fw * 4) / 16) * Math.ceil((fh * 4) / 16);
+    let ks = Math.max(1, Math.min(16, Math.floor(cin / 8), Math.ceil(TARGET_WG / wgs)));
+    const cinPer = Math.ceil(cin / ks);
+    ks = Math.ceil(cin / cinPer);
+    return { ks, cinPer };
+  }
 
   function half2float(h) {
     const s = h & 0x8000 ? -1 : 1;
@@ -134,8 +161,10 @@
         d.createComputePipeline({ layout: 'auto', compute: { module: d.createShaderModule({ code, label }), entryPoint: 'main' } });
       this.pipes = {
         prep: comp(W.prep, 'rife-prep'),
-        conv1: comp(W.conv(CONV_CFG[1]), 'rife-conv-s1'),
-        conv2: comp(W.conv(CONV_CFG[2]), 'rife-conv-s2'),
+        conv1: comp(W.conv(CONV_CFG.conv1), 'rife-conv-s1'),
+        conv1s: comp(W.conv(CONV_CFG.conv1s), 'rife-conv-s1-small'),
+        conv2: comp(W.conv(CONV_CFG.conv2), 'rife-conv-s2'),
+        reduce: comp(W.convReduce, 'rife-conv-reduce'),
         deconv: comp(W.deconv, 'rife-deconv'),
         accum: comp(W.accum, 'rife-accum'),
         pack: comp(W.pack, 'rife-pack'),
@@ -175,10 +204,22 @@
       let maxIn = 0;
       let maxMid = 0;
       let maxFeat = 0;
+      let maxPart = 0;
+      let maxTmp = 0;
       for (const p of plan) {
+        const L = this.layers[p.i];
         maxIn = Math.max(maxIn, p.inC * p.bw * p.bh);
         maxMid = Math.max(maxMid, (p.c / 2) * p.h1[0] * p.h1[1]);
         maxFeat = Math.max(maxFeat, p.c * p.h2[0] * p.h2[1]);
+        const part = (Lc, stride, ow, oh) => {
+          const c = convPlan(Lc, stride, ow, oh);
+          if (c.ks > 1) maxPart = Math.max(maxPart, c.ks * Lc.cout * ow * oh);
+        };
+        part(L.conv0[0], 2, p.h1[0], p.h1[1]);
+        part(L.conv0[1], 2, p.h2[0], p.h2[1]);
+        part(L.res[0], 1, p.h2[0], p.h2[1]);
+        const dp = deconvPlan(L.deconv.cin, p.h2[0], p.h2[1]);
+        maxTmp = Math.max(maxTmp, dp.ks * 5 * p.h2[0] * 4 * p.h2[1] * 4);
       }
       const sbuf = (n, extra = 0) => d.createBuffer({ size: Math.max(16, n * 4), usage: BU.STORAGE | extra });
       const bufs = {
@@ -186,7 +227,8 @@
         mid: sbuf(maxMid),
         f0: sbuf(maxFeat),
         f1: sbuf(maxFeat),
-        tmp: sbuf(5 * mw * mh),
+        tmp: sbuf(maxTmp),
+        part: sbuf(maxPart),
         fm: sbuf(5 * mw * mh, BU.COPY_SRC), // COPY_SRC: read back by tests
       };
       const steps = []; // static steps (everything except the frame-dependent block inputs)
@@ -195,42 +237,51 @@
           layout: pipe.getBindGroupLayout(0),
           entries: entries.map((r, i) => ({ binding: i, resource: r instanceof GPUBuffer ? { buffer: r } : r })),
         });
-      const convStep = (L, stride, inBuf, iw, ih, outBuf, ow, oh, resBuf) => {
-        const pipe = stride === 1 ? this.pipes.conv1 : this.pipes.conv2;
-        const cfg = CONV_CFG[stride];
-        const u = uni(new Uint32Array([L.cin, L.cout, iw, ih, ow, oh, L.wOff, L.bOff, resBuf ? 1 : 0, 1, 0, 0]));
-        return {
-          pipe,
-          bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, outBuf]),
-          wg: [Math.ceil(ow / (cfg.tx * cfg.px)), Math.ceil(oh / (cfg.ty * cfg.py)), L.cout / 16],
-          cost: L.cin * L.cout * 9 * ow * oh,
-        };
+      // Conv layer -> 1 step, or 2 with split-K (partial sums, then reduce + bias + residual + act).
+      const convSteps = (block, L, stride, inBuf, iw, ih, outBuf, ow, oh, resBuf) => {
+        const c = convPlan(L, stride, ow, oh);
+        const pipe = this.pipes[c.key];
+        const split = c.ks > 1;
+        const u = uni(new Uint32Array([L.cin, L.cout, iw, ih, ow, oh, L.wOff, L.bOff, resBuf ? 1 : 0, 1, c.ncog, c.cinPer, split ? 1 : 0, 0, 0, 0]));
+        const kind = stride === 1 ? 'conv1' : 'conv2';
+        const conv = { pipe, block, kind, bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, split ? bufs.part : outBuf]), wg: c.wg, cost: L.cin * L.cout * 9 * ow * oh };
+        if (!split) return [conv];
+        const n = L.cout * ow * oh;
+        const ru = uni(new Uint32Array([n, ow * oh, c.ks, resBuf ? 1 : 0, L.bOff, 1, 0, 0]));
+        const red = this.pipes.reduce;
+        return [conv, { pipe: red, block, kind, bg: bg(red, [ru, bufs.part, this.wbuf, resBuf || bufs.part, outBuf]), wg: [Math.ceil(n / 256), 1, 1], cost: n * c.ks }];
       };
       for (const p of plan) {
         const L = this.layers[p.i];
+        const b = p.i;
         p.prepIndex = steps.length;
         steps.push(null); // block input, filled per job
-        steps.push(convStep(L.conv0[0], 2, bufs.x, p.bw, p.bh, bufs.mid, p.h1[0], p.h1[1]));
-        steps.push(convStep(L.conv0[1], 2, bufs.mid, p.h1[0], p.h1[1], bufs.f0, p.h2[0], p.h2[1]));
+        steps.push(...convSteps(b, L.conv0[0], 2, bufs.x, p.bw, p.bh, bufs.mid, p.h1[0], p.h1[1]));
+        steps.push(...convSteps(b, L.conv0[1], 2, bufs.mid, p.h1[0], p.h1[1], bufs.f0, p.h2[0], p.h2[1]));
         let cur = bufs.f0;
         let other = bufs.f1;
         for (const R of L.res) {
-          steps.push(convStep(R, 1, cur, p.h2[0], p.h2[1], other, p.h2[0], p.h2[1], cur));
+          steps.push(...convSteps(b, R, 1, cur, p.h2[0], p.h2[1], other, p.h2[0], p.h2[1], cur));
           [cur, other] = [other, cur];
         }
         const [fw, fh] = p.h2;
-        const du = uni(new Uint32Array([L.deconv.cin, fw, fh, L.deconv.wOff, L.deconv.bOff, 0, 0, 0]));
+        const dp = deconvPlan(L.deconv.cin, fw, fh);
+        const du = uni(new Uint32Array([L.deconv.cin, fw, fh, L.deconv.wOff, L.deconv.bOff, dp.cinPer, 0, 0]));
         steps.push({
           pipe: this.pipes.deconv,
+          block: b,
+          kind: 'deconv',
           bg: bg(this.pipes.deconv, [du, cur, this.wbuf, bufs.tmp]),
-          wg: [Math.ceil((fw * 4) / 16), Math.ceil((fh * 4) / 16), 1],
+          wg: [Math.ceil((fw * 4) / 16), Math.ceil((fh * 4) / 16), dp.ks],
           cost: L.deconv.cin * 20 * fw * fh * 4,
         });
         const abuf = new ArrayBuffer(32);
-        new Uint32Array(abuf).set([mw, mh, fw * 4, fh * 4, 0, p.i === 0 ? 1 : 0, 0, 0]);
+        new Uint32Array(abuf).set([mw, mh, fw * 4, fh * 4, 0, p.i === 0 ? 1 : 0, dp.ks, 0]);
         new Float32Array(abuf)[4] = p.scale;
         steps.push({
           pipe: this.pipes.accum,
+          block: b,
+          kind: 'other',
           bg: bg(this.pipes.accum, [uni(abuf), bufs.tmp, bufs.fm]),
           wg: [Math.ceil(mw / 16), Math.ceil(mh / 16), 1],
           cost: mw * mh * 40,
@@ -256,6 +307,8 @@
       for (const p of r.plan) {
         steps[p.prepIndex] = {
           pipe: this.pipes.prep,
+          block: p.i,
+          kind: 'other',
           bg: d.createBindGroup({
             layout: this.pipes.prep.getBindGroupLayout(0),
             entries: [
@@ -272,6 +325,8 @@
       }
       steps.push({
         pipe: this.pipes.pack,
+        block: 3,
+        kind: 'other',
         bg: d.createBindGroup({
           layout: this.pipes.pack.getBindGroupLayout(0),
           entries: [

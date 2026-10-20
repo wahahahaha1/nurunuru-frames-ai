@@ -79,12 +79,8 @@
     return `<td class="${cls}">${pct.toFixed(0)}%</td>`;
   };
 
-  function kind(s, net) {
-    if (s.pipe === net.pipes.conv1) return '3×3 畳み込み（残差ブロック）';
-    if (s.pipe === net.pipes.conv2) return '3×3 畳み込み（ストライド 2）';
-    if (s.pipe === net.pipes.deconv) return '転置畳み込み';
-    return '入力の準備・ワープ・合成';
-  }
+  const KIND = { conv1: '3×3 畳み込み（残差ブロック）', conv2: '3×3 畳み込み（ストライド 2）', deconv: '転置畳み込み', other: '入力の準備・ワープ・合成' };
+  const BLOCK = ['段 1（1/8 解像度）', '段 2（1/4）', '段 3（1/2）', '段 4（等倍）'];
 
   async function run() {
     $('run').disabled = true;
@@ -115,11 +111,15 @@
         log(`${preset} ${mw}x${mh}: median ${ms.toFixed(2)} ms (${times.map((t) => t.toFixed(1)).join(', ')}) / ${(net.res.totalCost / 1e9).toFixed(1)} G 積和 → ${((2 * net.res.totalCost) / ms / 1e6).toFixed(0)} GFLOPS 相当`);
         if (preset === 'standard' && device.features.has('timestamp-query')) {
           const per = await timeGroups(device, job.steps.map((s) => [s]));
-          const sum = new Map();
-          job.steps.forEach((s, i) => sum.set(kind(s, net), (sum.get(kind(s, net)) || 0) + per[i]));
           const total = per.reduce((a, b) => a + b, 0);
+          const rows = (label) => {
+            const sum = new Map();
+            job.steps.forEach((s, i) => sum.set(label(s), (sum.get(label(s)) || 0) + per[i]));
+            return [...sum].map(([k, v]) => `<tr><td>${k}</td><td>${v.toFixed(2)} ms</td><td>${((100 * v) / total).toFixed(0)}%</td></tr>`).join('');
+          };
           const bd = $('breakdown').querySelector('tbody');
-          bd.innerHTML = [...sum].map(([k, v]) => `<tr><td>${k}</td><td>${v.toFixed(2)} ms</td><td>${((100 * v) / total).toFixed(0)}%</td></tr>`).join('');
+          bd.innerHTML = rows((s) => KIND[s.kind]) + '<tr><td colspan="3"></td></tr>' + rows((s) => BLOCK[s.block]);
+          log(`standard: ${job.steps.length} dispatches, sum of single-step passes ${total.toFixed(2)} ms`);
           $('breakdown').hidden = false;
           $('bdTitle').hidden = false;
         }

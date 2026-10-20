@@ -10,6 +10,7 @@
   const TU = GPUTextureUsage;
   const CHUNK_SHARE = 0.45; // share of a display frame one inference chunk should take
   const MAX_INFLIGHT = 2; // inference submissions the GPU may lag behind before pump() waits
+  const MEASURE_EVERY = 8; // every n-th inference job is timed step by step
 
   class Interpolator {
     constructor(device, net, params) {
@@ -35,13 +36,14 @@
       this.seq = 0;
       this.jobs = [];
       this.chunks = 4; // chunks per inference job (pump() keeps this up to date)
-      this.throughput = 1e6; // inference cost units (multiply-adds) per GPU ms, measured
-      this.measured = false;
+      // Measured GPU ms of each step of an inference job (layers differ a lot in efficiency, so the
+      // work is split by measured time, not by arithmetic cost). null entries = not measured yet.
+      this.stepMs = null;
+      this.jobCount = 0;
       this.inflight = 0; // submitted inference chunks the GPU has not finished yet
       // GPU timing (sampled): onTiming('me' | 'render', ms) reports inference per source frame and render cost.
       this.onTiming = null;
       this.timing = device.features.has('timestamp-query');
-      this.pumpCount = 0;
       this.renderCount = 0;
       if (this.timing) {
         this.querySet = device.createQuerySet({ type: 'timestamp', count: 4 });
@@ -76,13 +78,18 @@
 
     // GPU ms of one inference at the current model size (null until measured).
     jobMs() {
-      return this.measured && this.res ? this.net.res.totalCost / this.throughput : null;
+      return this.stepMs ? this.stepMs.reduce((a, b) => a + b, 0) : null;
     }
 
-    noteThroughput(cost, ms) {
-      const tp = cost / ms;
-      this.throughput = this.measured ? this.throughput + 0.2 * (tp - this.throughput) : tp;
-      this.measured = true;
+    // Estimated GPU ms of step i of a job (before the first measurement: 1 G multiply-adds per ms).
+    stepEst(steps, i) {
+      return this.stepMs ? this.stepMs[i] : steps[i].cost / 1e6 + 0.02;
+    }
+
+    // Fold the step times of a measured job into the running estimate and report the job time.
+    noteJobTimes(ms) {
+      if (!this.stepMs || this.stepMs.length !== ms.length) this.stepMs = ms.slice();
+      else for (let i = 0; i < ms.length; i++) this.stepMs[i] += 0.25 * (ms[i] - this.stepMs[i]);
       if (this.onTiming) this.onTiming('me', this.jobMs());
     }
 
@@ -148,6 +155,7 @@
         frames.push(fr);
       }
       this.jobs = [];
+      this.stepMs = null;
       this.res = { srcW, srcH, fw, fh, mw, mh, ingestU, tensorU, frames, next: 0 };
       return true;
     }
@@ -215,10 +223,15 @@
       cp.end();
       enc.clearBuffer(f.stats);
       d.queue.submit([enc.finish()]);
-      if (prev && prev.id > 0 && this.isLive(prev)) {
-        this.jobs.push({ a: prev, aId: prev.id, b: f, bId: f.id, steps: this.net.job(prev.tensor, f.tensor, f), next: 0 });
-      }
+      if (prev && prev.id > 0 && this.isLive(prev)) this.queueJob(prev, f);
       return f;
+    }
+
+    // Queue the inference for the pair (a -> b); pump() submits it.
+    queueJob(a, b) {
+      const steps = this.net.job(a.tensor, b.tensor, b);
+      const measure = this.jobCount++ % MEASURE_EVERY === 0;
+      this.jobs.push({ a, aId: a.id, b, bId: b.id, steps, next: 0, measure, ms: measure ? new Array(steps.length).fill(0) : null, pending: 0 });
     }
 
     // A frame record stays usable until its slot is reused.
@@ -232,50 +245,105 @@
     }
 
     // Submit the next chunk of queued inference. vsyncMs = display frame interval, srcMs = source
-    // frame interval. A job is split into `chunks` parts of about CHUNK_SHARE of a display frame each,
-    // but never into more parts than there are display frames per source frame (or it falls behind).
+    // frame interval. A job is split into chunks of about CHUNK_SHARE of a display frame of GPU time
+    // each, but into no more chunks than there are display frames per source frame (or it falls
+    // behind). One pump never spans two jobs.
     pump(vsyncMs, srcMs) {
       const d = this.device;
       this.jobs = this.jobs.filter((j) => j.a.id === j.aId && j.b.id === j.bId && this.isLive(j.a) && this.isLive(j.b));
       // behind: skip pairs rather than lag further, but finish the one already under way
       while (this.jobs.length > 2) this.jobs.splice(this.jobs[0].next > 0 ? 1 : 0, 1);
       if (!this.jobs.length || !this.res || this.inflight >= MAX_INFLIGHT) return;
-      const total = this.net.res.totalCost;
-      const jobMs = total / this.throughput;
+      const job = this.jobs[0];
+      const steps = job.steps;
+      let jobMs = 0;
+      for (let i = 0; i < steps.length; i++) jobMs += this.stepEst(steps, i);
       const maxChunks = Math.max(1, Math.floor((0.75 * srcMs) / vsyncMs));
-      this.chunks = Math.max(1, Math.min(maxChunks, Math.ceil(jobMs / (CHUNK_SHARE * vsyncMs))));
-      const budget = total / this.chunks;
+      const target = Math.max(CHUNK_SHARE * vsyncMs, jobMs / maxChunks);
+      // chunk count of a whole job at this target (for the player's latency allowance)
+      let chunks = 1;
+      for (let i = 0, acc = 0; i < steps.length; i++) {
+        const e = this.stepEst(steps, i);
+        if (acc > 0 && acc + e > target) {
+          chunks++;
+          acc = 0;
+        }
+        acc += e;
+      }
+      this.chunks = chunks;
+      const first = job.next;
+      let last = first;
+      for (let acc = 0; last < steps.length; last++) {
+        const e = this.stepEst(steps, last);
+        if (last > first && acc + e > target) break;
+        acc += e;
+      }
       const enc = d.createCommandEncoder();
-      const rb = this.sample(this.pumpCount++, 4);
-      const cp = enc.beginComputePass({
-        timestampWrites: rb ? { querySet: this.querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } : undefined,
-      });
-      let spent = 0;
-      while (this.jobs.length && spent < budget * 0.95) {
-        const job = this.jobs[0];
-        const s = job.steps[job.next++];
+      const timed = this.timing && job.measure;
+      let qs = null;
+      if (timed) qs = d.createQuerySet({ type: 'timestamp', count: 2 * (last - first) });
+      let cp = null;
+      for (let i = first; i < last; i++) {
+        const s = steps[i];
+        if (!cp || timed) {
+          if (cp) cp.end();
+          cp = enc.beginComputePass(
+            timed ? { timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 2 * (i - first), endOfPassWriteIndex: 2 * (i - first) + 1 } } : undefined
+          );
+        }
         cp.setPipeline(s.pipe);
         cp.setBindGroup(0, s.bg);
         cp.dispatchWorkgroups(...s.wg);
-        spent += s.cost;
-        if (job.next === job.steps.length) {
-          job.b.hasPair = true;
-          job.b.pairPrevId = job.aId;
-          this.jobs.shift();
-        }
       }
       cp.end();
-      const report = rb ? this.finishSample(enc, rb, 0, (ms) => this.noteThroughput(spent, ms)) : null;
+      job.next = last;
+      let read = null;
+      if (timed) {
+        const size = 16 * (last - first);
+        const resolve = d.createBuffer({ size, usage: BU.QUERY_RESOLVE | BU.COPY_SRC });
+        read = d.createBuffer({ size, usage: BU.COPY_DST | BU.MAP_READ });
+        enc.resolveQuerySet(qs, 0, 2 * (last - first), resolve, 0);
+        enc.copyBufferToBuffer(resolve, 0, read, 0, size);
+        read.resolve = resolve;
+      }
+      if (last === steps.length) {
+        job.b.hasPair = true;
+        job.b.pairPrevId = job.aId;
+        this.jobs.shift();
+      }
       d.queue.submit([enc.finish()]);
-      if (report) report();
+      const done = () => {
+        if (--job.pending === 0 && job.next === steps.length && job.ms) this.noteJobTimes(job.ms);
+      };
+      if (job.ms) job.pending++;
+      if (read) {
+        read.mapAsync(GPUMapMode.READ).then(
+          () => {
+            const t = new BigInt64Array(read.getMappedRange());
+            for (let i = first; i < last; i++) {
+              const ms = Number(t[2 * (i - first) + 1] - t[2 * (i - first)]) / 1e6;
+              job.ms[i] = ms >= 0 && ms < 1000 ? ms * (S.debugGpuScale || 1) : 0;
+            }
+            read.unmap();
+            [qs, read.resolve, read].forEach((r) => r.destroy());
+            done();
+          },
+          () => {} // device lost / destroyed
+        );
+      }
       const t0 = performance.now();
-      const probe = !this.timing && this.pumpCount % 8 === 1;
       this.inflight++;
       d.queue.onSubmittedWorkDone().then(
         () => {
           this.inflight--;
-          // no timestamp queries: queue completion latency (an overestimate) instead
-          if (probe) this.noteThroughput(spent, Math.max(0.1, performance.now() - t0));
+          if (!this.timing && job.ms) {
+            // no timestamp queries: spread the chunk's completion latency (an overestimate) over its steps by cost
+            let cost = 0;
+            for (let i = first; i < last; i++) cost += steps[i].cost + 1e5;
+            const ms = performance.now() - t0;
+            for (let i = first; i < last; i++) job.ms[i] = (ms * (steps[i].cost + 1e5)) / cost;
+            done();
+          }
         },
         () => {}
       );
