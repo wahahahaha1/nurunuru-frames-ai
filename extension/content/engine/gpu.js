@@ -30,7 +30,12 @@
       if (!adapter) throw new Error('WebGPU アダプターを取得できません');
       // timestamp queries let the player measure its own GPU cost (performance guard)
       const requiredFeatures = adapter.features.has('timestamp-query') ? ['timestamp-query'] : [];
-      const device = await adapter.requestDevice({ requiredFeatures });
+      // RIFE's scratch buffers at the high-quality preset come close to the default 128 MiB binding limit
+      const requiredLimits = {
+        maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+        maxBufferSize: adapter.limits.maxBufferSize,
+      };
+      const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
       device.lost.then((info) => {
         S._devicePromise = null;
         if (S.onDeviceLost) S.onDeviceLost(info);

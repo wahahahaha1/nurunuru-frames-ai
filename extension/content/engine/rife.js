@@ -210,11 +210,24 @@
       return n;
     }
 
-    // Picture size (cw x ch, width about `width`, sides multiples of 8) and padded model input size.
+    // Picture size (cw x ch, sides multiples of 8) and padded model input size, about `width` wide.
+    // Portrait pictures (vertical video) get the area of a 16:9 picture of that width instead (the
+    // same cost; at full width they would cost several times more).
     static modelSize(srcW, srcH, width, modulo) {
-      const cw = Math.max(64, Math.round(Math.min(width, srcW) / 8) * 8);
+      const cw = Math.max(64, Math.round(Math.min(width * RifeNet.widthFactor(srcW, srcH), srcW) / 8) * 8);
       const ch = Math.max(32, Math.round((cw * srcH) / srcW / 8) * 8);
       return { cw, ch, pw: Math.ceil(cw / modulo) * modulo, ph: Math.ceil(ch / modulo) * modulo };
+    }
+
+    // Model width / `width` for a srcW x srcH picture (1 up to square, less for portrait).
+    static widthFactor(srcW, srcH) {
+      const a = srcH / srcW;
+      return a > 1 ? Math.sqrt(9 / 16 / a) : 1;
+    }
+
+    // Bytes of the largest scratch buffer at padded size pw x ph (the last block's input).
+    static scratchBytes(pw, ph) {
+      return 28 * 4 * pw * ph;
     }
 
     // Floats in one frame tensor.
@@ -347,8 +360,10 @@
     // Head steps for a frame tensor: features into planes 3-6 (cached per tensor buffer).
     headSteps(tensor) {
       const r = this.res;
-      let steps = r.headCache.get(tensor);
-      if (steps) return steps;
+      const hit = r.headCache.get(tensor);
+      if (hit) return hit.steps;
+      const nu = r.uniforms.length;
+      let steps;
       const { pw, ph, bufs } = r;
       const hw = pw / 2;
       const hh = ph / 2;
@@ -369,8 +384,20 @@
         wg: [Math.ceil(pw / 16), Math.ceil(ph / 16), 1],
         cost: D.cin * 4 * 4 * pw * ph,
       });
-      r.headCache.set(tensor, steps);
+      r.headCache.set(tensor, { steps, uniforms: r.uniforms.splice(nu) });
       return steps;
+    }
+
+    // Drop the cached Head steps of frame tensors that are being freed.
+    forgetHeads(tensors) {
+      const r = this.res;
+      if (!r) return;
+      for (const t of tensors) {
+        const hit = r.headCache.get(t);
+        if (!hit) continue;
+        for (const b of hit.uniforms) b.destroy();
+        r.headCache.delete(t);
+      }
     }
 
     // Step list for the pair (tensors a -> b, Head features already computed) at timestep ts; the
@@ -413,6 +440,7 @@
       if (!this.res) return;
       for (const b of Object.values(this.res.bufs)) b.destroy();
       for (const b of this.res.uniforms) b.destroy();
+      for (const hit of this.res.headCache.values()) for (const b of hit.uniforms) b.destroy();
       this.res = null;
     }
 

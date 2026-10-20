@@ -34,9 +34,10 @@
       if (!this.diffs) this.diffs = [];
     }
 
-    // New source: forget the frame-rate estimate too.
+    // New source: forget the frame-rate estimate and the underrun margin too.
     resetAll() {
       this.diffs = [];
+      this.margin = 0;
       this.reset();
     }
 

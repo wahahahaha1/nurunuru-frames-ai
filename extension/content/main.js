@@ -31,15 +31,15 @@
       this.dirty = true;
       this.renderedSize = '';
       this.stats = { frames: 0, interp: 0, since: performance.now(), outFps: 0, interpPct: 0 };
-      // performance guard: measured GPU ms per source frame (me = inference) / output frame (render)
-      this.perf = { me: null, render: null, over: 0, starve: 0, presetCap: null, outDiv: 1, note: '', stopped: false };
+      // performance guard: measured GPU ms per inference (me) / output frame (render)
+      this.resetPerf();
       this.rafCount = 0;
       this.onFrame = this.onFrame.bind(this);
       this.onRaf = this.onRaf.bind(this);
       this.handlers = {
         seeking: () => this.flush(),
-        emptied: () => this.flush(true),
-        loadstart: () => this.flush(true),
+        emptied: () => this.newSource(),
+        loadstart: () => this.newSource(),
         ratechange: () => (this.clock.offset = null),
         play: () => {
           this.clock.offset = null;
@@ -79,11 +79,30 @@
       }
     }
 
+    resetPerf() {
+      // (a preset that lost the GPU device is not retried until the user changes the settings)
+      const presetCap = S.lostPresetCap || null;
+      this.perf = { me: null, render: null, over: 0, starve: 0, presetCap, outDiv: 1, note: '', stopped: false, demand: null, demandRate: null, done: null };
+    }
+
+    // A new video in the same element (YouTube reuses it): forget failures and automatic downgrades.
+    newSource() {
+      this.flush(true);
+      this.failed = null;
+      this.errors = 0;
+      this.resetPerf();
+      if (this.ready) this.applyEngineParams();
+    }
+
     applySettings(s) {
-      if (s.preset !== this.settings.preset) {
-        // the user picked a preset: forget automatic downgrades and try again
+      const o = this.settings;
+      const engineChanged = ['preset', 'hybrid', 'multiscale', 'anchors'].some((k) => s[k] !== o[k]);
+      if (engineChanged || this.perf.stopped) {
+        // the user changed something: forget automatic downgrades (and a stop) and try again
         if (this.perf.stopped) this.failed = null;
-        this.perf = { me: null, render: null, over: 0, starve: 0, presetCap: null, outDiv: 1, note: '', stopped: false };
+        this.errors = 0;
+        S.lostPresetCap = null;
+        this.resetPerf();
       }
       this.settings = s;
       this.osd.show(!!s.osd);
@@ -100,15 +119,20 @@
       if (this.perf.noHalf) params.multiscale = false;
       this.engine.setParams(params);
       if (this.engine.res !== old) this.flush();
-      if (params.model !== this.engine.net.model) {
+      if (params.model !== this.engine.net.model && this.loadingModel !== params.model) {
         // another model: load it (once per page), then switch
+        this.loadingModel = params.model;
         S.getRifeNet(this.device, params.model).then(
           (net) => {
+            this.loadingModel = null;
             if (!this.active || !this.engine || S.engineParams({ ...this.settings, preset: this.effectivePreset() }).model !== net.model) return;
             this.engine.setNet(net);
             this.flush();
           },
-          (e) => this.fail(e.message)
+          (e) => {
+            this.loadingModel = null;
+            this.fail(e.message);
+          }
         );
       }
     }
@@ -141,11 +165,13 @@
       return this.targetRate() / this.perf.outDiv;
     }
 
-    // Share of GPU time used by interpolation: motion per source frame + render per output frame.
+    // Share of GPU time used by interpolation: inference per pair that needs it (pairs per second,
+    // measured: drawings on twos / threes need fewer than the source rate) + render per output frame.
     gpuLoad() {
       const p = this.perf;
       if (p.me == null) return null;
-      return (p.me * this.srcRate() + (p.render || 0) * this.outRate()) / 1000;
+      const rate = p.demandRate != null ? p.demandRate : this.srcRate();
+      return (p.me * rate + (p.render || 0) * this.outRate()) / 1000;
     }
 
     // Called once per second while interpolating. After 3 s over the limit: drop the optional extra
@@ -153,9 +179,19 @@
     // then give up (show the original video). No finished inference for 5 s (a GPU too slow to even
     // report its timing) counts as over the limit.
     checkPerf() {
-      const load = this.gpuLoad();
       const p = this.perf;
-      p.starve = this.stats.interpPct < 1 ? p.starve + 1 : 0;
+      const e = this.engine;
+      const v = this.video;
+      // pairs needing inference / completed in the last second
+      const wanted = p.demand == null ? 0 : e.demand - p.demand;
+      const finished = p.done == null ? 0 : e.done - p.done;
+      if (p.demand != null) p.demandRate = p.demandRate == null ? wanted : p.demandRate + 0.3 * (wanted - p.demandRate);
+      p.demand = e.demand;
+      p.done = e.done;
+      const load = this.gpuLoad();
+      // starving: inference was wanted while playing but none finished (not a still picture or buffering)
+      const playing = !v.seeking && v.readyState >= 3;
+      if (playing && wanted > 0) p.starve = finished === 0 ? p.starve + 1 : 0;
       const starving = p.starve >= 5;
       if (load == null && !starving) return;
       p.over = starving || load > LOAD_LIMIT ? p.over + 1 : 0;
@@ -187,7 +223,7 @@
       } else {
         p.stopped = true;
         p.note = '';
-        this.fail('GPU の性能が足りないため補間を停止しました（プリセットを選び直すと再試行します）');
+        this.fail('GPU の性能が足りないため補間を停止しました（設定を変えるか、次の動画で再試行します）');
       }
     }
 
@@ -289,7 +325,9 @@
         } catch (e) {
           this.noteError(e.message);
         }
-        c.extra = this.engine.chunks * c.vsync;
+        // inference latency allowance: up at once, down slowly (the chunk count varies job to job)
+        const want = this.engine.chunks * c.vsync;
+        c.extra = want >= c.extra ? want : Math.max(want, c.extra - 0.02 * c.vsync);
       }
     }
 
@@ -384,6 +422,10 @@
         st.frames = 0;
         st.interp = 0;
         st.since = ts;
+        // the underrun margin shrinks again while no underruns occur
+        const c = this.clock;
+        if (c.underruns === this.lastUnderruns) c.margin = Math.max(0, c.margin - 0.0005);
+        this.lastUnderruns = c.underruns;
         if (!this.reason && !this.video.paused && this.ready) this.checkPerf();
         if (this.osd.on) this.osd.update(this.statusText());
       }
@@ -501,6 +543,9 @@
   S.onDeviceLost = (info) => {
     console.warn(TAG, 'GPU device lost:', info && info.message);
     if (player) {
+      // the next player starts one preset lower (until the user changes the settings)
+      const cur = player.effectivePreset();
+      S.lostPresetCap = PRESET_ORDER[Math.max(0, PRESET_ORDER.indexOf(cur) - 1)];
       player.destroy();
       player = null;
     }

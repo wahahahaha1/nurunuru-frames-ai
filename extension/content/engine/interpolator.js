@@ -47,6 +47,10 @@
       this.stepMs = new Map();
       this.jobCount = 0;
       this.inflight = 0; // submitted inference chunks the GPU has not finished yet
+      // pairs that needed inference (started, or skipped for being behind) / were completed, for the
+      // player's load and starvation checks (repeated drawings need none)
+      this.demand = 0;
+      this.done = 0;
       // GPU timing (sampled): onTiming('me' | 'render', ms) reports inference per source frame and render cost.
       this.onTiming = null;
       this.timing = device.features.has('timestamp-query');
@@ -114,13 +118,13 @@
     // Switch to another network (model change); everything is reallocated.
     setNet(net) {
       if (net === this.net) return;
+      const src = this.res && [this.res.srcW, this.res.srcH];
+      this.destroyResources();
+      this.netH.destroyResources();
+      this.net.destroyResources(); // the previous model's scratch (reallocated if switched back)
       this.net = net;
       this.netH = net.sibling('H');
-      if (this.res) {
-        const { srcW, srcH } = this.res;
-        this.destroyResources();
-        this.configure(srcW, srcH);
-      }
+      if (src) this.configure(...src);
     }
 
     setParams(params) {
@@ -142,9 +146,15 @@
       const fs = Math.min(1, p.maxFrameWidth / srcW);
       const fw = Math.max(16, Math.round(srcW * fs));
       const fh = Math.max(16, Math.round(srcH * fs));
-      const { cw: mw, ch: mh, pw, ph } = S.RifeNet.modelSize(srcW, srcH, p.modelWidth, this.net.spec.modulo);
+      // (smaller where the largest scratch buffer would exceed the device's binding size)
+      let size = S.RifeNet.modelSize(srcW, srcH, p.modelWidth, this.net.spec.modulo);
+      for (let w = p.modelWidth; S.RifeNet.scratchBytes(size.pw, size.ph) > d.limits.maxStorageBufferBindingSize && w > 128; ) {
+        w *= 0.9;
+        size = S.RifeNet.modelSize(srcW, srcH, w, this.net.spec.modulo);
+      }
+      const { cw: mw, ch: mh, pw, ph } = size;
       this.net.configure(mw, mh);
-      const half = S.RifeNet.modelSize(srcW, srcH, Math.round(mw / 2), this.net.spec.modulo);
+      const half = S.RifeNet.modelSize(srcW, srcH, Math.round(mw / 2) / S.RifeNet.widthFactor(srcW, srcH), this.net.spec.modulo);
       this.netH.configure(half.cw, half.ch);
       const uni = (data) => {
         const b = d.createBuffer({ size: Math.max(16, data.byteLength), usage: BU.UNIFORM | BU.COPY_DST });
@@ -174,6 +184,7 @@
           flowH: d.createTexture({ size: [half.cw, half.ch], format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
           maskH: d.createTexture({ size: [half.cw, half.ch], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
           featH: false, // Head features of the half-resolution tensor are submitted
+          hasTensorH: false, // the half-resolution tensor holds this frame
           stats: d.createBuffer({ size: 16, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC }),
           id: -1, // sequence number of the frame currently held
           hasPair: false, // RIFE result for (id-1 -> id) is complete
@@ -303,6 +314,8 @@
 
     destroyResources() {
       if (!this.res) return;
+      this.net.forgetHeads(this.res.frames.map((f) => f.tensor));
+      this.netH.forgetHeads(this.res.frames.map((f) => f.tensorH));
       for (const f of this.res.frames) {
         f.tex.destroy();
         f.tensor.destroy();
@@ -331,6 +344,7 @@
 
     destroy() {
       this.destroyResources();
+      this.netH.destroyResources();
       this.bm.destroy();
       this.renderU.destroy();
       this.zeroTex.destroy();
@@ -387,6 +401,7 @@
       f.pairPrevId = -1;
       f.feat = false;
       f.featH = false;
+      f.hasTensorH = this.options().useHalf;
       f.sameAs = null;
       f.drawId = f.id; // id of the frame that first showed this drawing
       f.pairDrawId = -1;
@@ -437,6 +452,9 @@
     startJob(job) {
       const steps = [];
       const o = this.options();
+      // (half resolution was switched on after one of the frames came in: its half tensor is stale)
+      if (!job.a.hasTensorH || !job.b.hasTensorH) o.useHalf = false;
+      this.demand++;
       for (const f of [job.a, job.b]) {
         if (!f.feat) {
           steps.push(...this.net.headSteps(f.tensor));
@@ -474,7 +492,10 @@
       const d = this.device;
       this.jobs = this.jobs.filter((j) => j.a.id === j.aId && j.b.id === j.bId && this.isLive(j.a) && this.isLive(j.b));
       // behind: skip pairs rather than lag further, but finish the one already under way
-      while (this.jobs.length > 2) this.jobs.splice(this.jobs[0].next > 0 ? 1 : 0, 1);
+      while (this.jobs.length > 2) {
+        const [j] = this.jobs.splice(this.jobs[0].next > 0 ? 1 : 0, 1);
+        if (j.b.dupState !== 'dup') this.demand++;
+      }
       if (!this.jobs.length || !this.res || this.inflight >= MAX_INFLIGHT) return;
       const job = this.jobs[0];
       if (!job.steps) {
@@ -556,6 +577,7 @@
         job.b.hasHalf = job.useHalf;
         job.b.pairPrevId = job.aId;
         job.b.pairDrawId = job.a.drawId;
+        this.done++;
       }
       if (last === steps.length) this.jobs.shift();
       d.queue.submit([enc.finish()]);
