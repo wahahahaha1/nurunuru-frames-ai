@@ -554,12 +554,10 @@ fn bmInterp(p: vec2f, t: f32) -> vec4f {
 }
 `;
 
-  // Per pair, on the mid-time grid (picture size): which motion to trust where. Compares, averaged
-  // over +-4 px (5x5 samples), how well each explains the two frames at t = 0.5 (photometric error of
-  // its two warps): r = weight of block matching (only where it is clearly better and itself
-  // consistent), g = confidence (low where both disagree). Where RIFE's mask clearly prefers one
-  // frame (occlusion: the other warp is expected to disagree) its error does not count, and block
-  // matching is not used.
+  // Per pair, on the mid-time grid (model size): which motion to trust where. Measures, over +-4 px
+  // (5x5 samples), how well each explains the two frames at t = 0.5 (photometric error of its two
+  // warps) along with local motion and structure cues, and turns them into r = weight of block
+  // matching (a fitted logistic model), g = confidence (low where both disagree).
   const select = /* wgsl */ `
 struct SU { fieldScale: vec2f, size: vec2f, useHalf: f32, pad0: f32, pad1: f32, pad2: f32 };
 @group(0) @binding(0) var<uniform> U: SU;
@@ -642,17 +640,14 @@ ${bmInterp}
   // frames in both directions, RIFE's one-sided mask is not an excuse and its full disagreement counts
   let bmGood = 1.0 - smoothstep(0.004, 0.015, eB2);
   eA = mix(eA, eAraw, bmGood);
-  // RIFE breaking down locally (RMS error well above block matching's, e.g. ghosted text)
+  // local RMS errors (RIFE breaking down, e.g. ghosted text, shows as RMS well above its mean)
   let rmsA = sqrt(mix(sq.x, sq.y, bmGood) / 25.0);
   let rmsB = sqrt(sq.z / 25.0);
-  let rifeFail = smoothstep(1.5, 2.5, (rmsA + 0.002) / (rmsB + 0.002)) * smoothstep(0.015, 0.03, rmsA);
   // half-resolution RIFE where it explains the frames clearly better (large motion)
   let wH = smoothstep(0.002, 0.01, eA - eH) * U.useHalf;
   eA = mix(eA, eH, wH);
-  // motion boundaries (either motion varies by more than a pixel within +-4 px): block matching's
-  // blocks straddle them, so RIFE keeps them. RIFE's flow only counts where RIFE itself explains the
-  // frames: where it fails (e.g. scrolling text) its flow is ragged while block matching is right.
-  // Local structure tells how informative the errors above are.
+  // how much either motion varies within +-4 px (motion boundaries: block matching's blocks straddle
+  // them) and how much structure the picture has (how informative the errors above are)
   var lo = vec4f(1e9);
   var hi = vec4f(-1e9);
   var tex = 0.0;
@@ -668,16 +663,25 @@ ${bmInterp}
     }
   }
   tex = smoothstep(0.01, 0.04, tex / 25.0); // 0 = flat, errors say little
-  let rifeOk = 1.0 - smoothstep(0.01, 0.03, eA);
-  // (where RIFE breaks down, block matching's wandering vectors are the lesser evil)
-  let spread = max(max(hi.x - lo.x, hi.y - lo.y) * rifeOk, max(hi.z - lo.z, hi.w - lo.w) * (1.0 - rifeFail));
-  // (a one-sided RIFE mask hints at occlusion, but RIFE also leans on one frame where both match:
-  // block matching that explains the frames almost perfectly is still taken there)
-  // ties go to block matching only where the picture has structure; in flat areas it must win clearly
-  let tie = mix(0.002, -0.001, tex);
-  let wBM = smoothstep(tie, tie + 0.003, eA - eB) * (1.0 - smoothstep(0.03, 0.08, eB))
-    * (1.0 - smoothstep(0.5, 0.8, occ) * smoothstep(0.004, 0.015, eB2))
-    * (1.0 - smoothstep(1.0, 2.5, spread));
+  // Weight of block matching: logistic model fitted on the synthetic test scenes (maximising their mean
+  // PSNR without making any scene worse than the previous hand-tuned rule). Pixel quantities are
+  // measured on a 640-wide grid. Inputs: the errors above, RIFE's one-sidedness, structure, how much
+  // either motion varies nearby, the motion lengths, RIFE's mask, block matching's match cost and the
+  // distance to the picture edge in motions (content entering the picture).
+  let px = 640.0 / U.size.x;
+  let fc0 = textureSampleLevel(flowT, samp, p0, 0.0);
+  let fb0 = Fb(p0);
+  let magR = min(length((fc0.zw - fc0.xy) * U.size) * px, 64.0);
+  let magB = min(length(fb0.xy * U.size) * px, 64.0);
+  let edge = min(min(p0.x, 1.0 - p0.x) * U.size.x, min(p0.y, 1.0 - p0.y) * U.size.y) * px;
+  let lg = vec4f(log(eA + 1e-3), log(eAraw + 1e-3), log(eB + 1e-3), log(eB2 + 1e-3));
+  let lr = vec2f(log(rmsA + 1e-3), log(rmsB + 1e-3));
+  let z = -4.5558 + dot(lg, vec4f(-0.5027, 1.2137, -0.1363, -0.7874)) + 0.8933 * occ + dot(lr, vec2f(0.3583, -0.5895))
+    + 1.2700 * tex + 0.0366 * log(1.0 + max(hi.x - lo.x, hi.y - lo.y) * px) - 0.2750 * log(1.0 + max(hi.z - lo.z, hi.w - lo.w) * px)
+    - 0.7804 * log(1.0 + magR) + 0.2947 * log(1.0 + magB)
+    - 0.3030 * abs(2.0 * textureSampleLevel(maskT, samp, p0, 0.0).r - 1.0) - 0.2767 * log(min(fb0.z, 1.0) + 1e-3)
+    + 0.5601 * log(1.0 + edge / (max(magR, magB) + 1.0));
+  let wBM = 1.0 / (1.0 + exp(-z));
   let conf = 1.0 - smoothstep(0.05, 0.15, min(eA, eB));
   textureStore(selOut, g.xy, vec4f(wBM, conf, wH, 1.0));
 }
