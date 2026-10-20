@@ -15,7 +15,7 @@
   // Tuning shared by all presets.
   S.TUNING = {
     maxFrameWidth: 2560, // frames wider than this are downscaled on ingest
-    sceneFrac: 0.45, // share of pixels whose warped samples disagree that marks a scene change
+    sceneFrac: 0.3, // share of pixels whose warped samples disagree that marks a scene change
     masking: 0, // 0..1, artifact masking towards a plain blend
   };
 

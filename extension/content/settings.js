@@ -57,6 +57,6 @@
     anchors: !!s.anchors,
     multiscale: !!s.multiscale,
     masking: s.masking / 100,
-    sceneFrac: 0.9 - (0.75 * s.sceneSensitivity) / 100,
+    sceneFrac: 0.6 - (0.5 * s.sceneSensitivity) / 100, // default 60 -> 0.3 (normal pairs stay below ~0.1, cuts mostly above 0.45)
   });
 })();
