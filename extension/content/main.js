@@ -97,6 +97,7 @@
       const old = this.engine.res;
       const params = S.engineParams({ ...this.settings, preset: this.effectivePreset() });
       if (this.perf.noAnchors) params.anchors = false;
+      if (this.perf.noHalf) params.multiscale = false;
       this.engine.setParams(params);
       if (this.engine.res !== old) this.flush();
       if (params.model !== this.engine.net.model) {
@@ -147,9 +148,10 @@
       return (p.me * this.srcRate() + (p.render || 0) * this.outRate()) / 1000;
     }
 
-    // Called once per second while interpolating. After 3 s over the limit: lower the preset,
-    // then halve the output frame rate, then give up (show the original video). No finished
-    // inference for 5 s (a GPU too slow to even report its timing) counts as over the limit.
+    // Called once per second while interpolating. After 3 s over the limit: drop the optional extra
+    // inferences (anchors, then half resolution), lower the preset, then halve the output frame rate,
+    // then give up (show the original video). No finished inference for 5 s (a GPU too slow to even
+    // report its timing) counts as over the limit.
     checkPerf() {
       const load = this.gpuLoad();
       const p = this.perf;
@@ -166,6 +168,11 @@
         p.noAnchors = true;
         p.me = null;
         p.note = 'GPU 負荷が高いため「大きな動きを高精度に」を自動でオフにしました';
+        this.applyEngineParams();
+      } else if (this.engine.params.multiscale !== false && this.engine.params.hybrid !== false && !p.noHalf) {
+        p.noHalf = true;
+        p.me = null;
+        p.note = 'GPU 負荷が高いため「半分の解像度でも推論」を自動でオフにしました';
         this.applyEngineParams();
       } else if (cur !== 'fast') {
         p.presetCap = PRESET_ORDER[PRESET_ORDER.indexOf(cur) - 1];

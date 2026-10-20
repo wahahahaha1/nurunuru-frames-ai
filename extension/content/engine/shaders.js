@@ -612,6 +612,8 @@ ${bmInterp}
   var eA = 0.0;
   var eAraw = 0.0;
   var eH = 0.0;
+  var eHraw = 0.0;
+  var sqH = 0.0;
   var eB = 0.0;
   var eB2 = 0.0; // block matching, both directions
   var occ = 0.0;
@@ -625,7 +627,12 @@ ${bmInterp}
       eA += ra.x;
       eAraw += ra.z;
       occ = max(occ, ra.y);
-      if (U.useHalf > 0.0) { eH += rifeErr(p, flowH, maskH).x; }
+      if (U.useHalf > 0.0) {
+        let rh = rifeErr(p, flowH, maskH);
+        eH += rh.x;
+        eHraw += rh.z;
+        sqH += rh.z * rh.z;
+      }
       eB += eb;
       eB2 += eb2;
       sq += vec3f(ra.x * ra.x, ra.z * ra.z, eb2 * eb2);
@@ -634,6 +641,7 @@ ${bmInterp}
   eA /= 25.0;
   eAraw /= 25.0;
   eH /= 25.0;
+  eHraw /= 25.0;
   eB /= 25.0;
   eB2 /= 25.0;
   // a true occlusion defeats block matching in one direction; where block matching explains both
@@ -643,9 +651,6 @@ ${bmInterp}
   // local RMS errors (RIFE breaking down, e.g. ghosted text, shows as RMS well above its mean)
   let rmsA = sqrt(mix(sq.x, sq.y, bmGood) / 25.0);
   let rmsB = sqrt(sq.z / 25.0);
-  // half-resolution RIFE where it explains the frames clearly better (large motion)
-  let wH = smoothstep(0.002, 0.01, eA - eH) * U.useHalf;
-  eA = mix(eA, eH, wH);
   // how much either motion varies within +-4 px (motion boundaries: block matching's blocks straddle
   // them) and how much structure the picture has (how informative the errors above are)
   var lo = vec4f(1e9);
@@ -663,11 +668,11 @@ ${bmInterp}
     }
   }
   tex = smoothstep(0.01, 0.04, tex / 25.0); // 0 = flat, errors say little
-  // Weight of block matching: logistic model fitted on the synthetic test scenes (maximising their mean
-  // PSNR without making any scene worse than the previous hand-tuned rule). Pixel quantities are
-  // measured on a 640-wide grid. Inputs: the errors above, RIFE's one-sidedness, structure, how much
-  // either motion varies nearby, the motion lengths, RIFE's mask, block matching's match cost and the
-  // distance to the picture edge in motions (content entering the picture).
+  // Weights of block matching and (if computed) of half-resolution RIFE: logistic models fitted on the
+  // synthetic test scenes (maximising their mean PSNR without making any scene worse than the
+  // previous rule). Pixel quantities are measured on a 640-wide grid. Inputs: the errors above, RIFE's
+  // one-sidedness, structure, how much either motion varies nearby, the motion lengths, RIFE's mask,
+  // block matching's match cost and the distance to the picture edge in motions (content entering).
   let px = 640.0 / U.size.x;
   let fc0 = textureSampleLevel(flowT, samp, p0, 0.0);
   let fb0 = Fb(p0);
@@ -676,12 +681,27 @@ ${bmInterp}
   let edge = min(min(p0.x, 1.0 - p0.x) * U.size.x, min(p0.y, 1.0 - p0.y) * U.size.y) * px;
   let lg = vec4f(log(eA + 1e-3), log(eAraw + 1e-3), log(eB + 1e-3), log(eB2 + 1e-3));
   let lr = vec2f(log(rmsA + 1e-3), log(rmsB + 1e-3));
-  let z = -4.5558 + dot(lg, vec4f(-0.5027, 1.2137, -0.1363, -0.7874)) + 0.8933 * occ + dot(lr, vec2f(0.3583, -0.5895))
-    + 1.2700 * tex + 0.0366 * log(1.0 + max(hi.x - lo.x, hi.y - lo.y) * px) - 0.2750 * log(1.0 + max(hi.z - lo.z, hi.w - lo.w) * px)
-    - 0.7804 * log(1.0 + magR) + 0.2947 * log(1.0 + magB)
-    - 0.3030 * abs(2.0 * textureSampleLevel(maskT, samp, p0, 0.0).r - 1.0) - 0.2767 * log(min(fb0.z, 1.0) + 1e-3)
-    + 0.5601 * log(1.0 + edge / (max(magR, magB) + 1.0));
-  let wBM = 1.0 / (1.0 + exp(-z));
+  // tex, spread of RIFE's / block matching's motion, motion lengths, RIFE's one-sidedness at p0,
+  // block matching's cost, distance to the edge
+  let x1 = vec4f(tex, log(1.0 + max(hi.x - lo.x, hi.y - lo.y) * px), log(1.0 + max(hi.z - lo.z, hi.w - lo.w) * px), log(1.0 + magR));
+  let x2 = vec4f(log(1.0 + magB), abs(2.0 * textureSampleLevel(maskT, samp, p0, 0.0).r - 1.0), log(min(fb0.z, 1.0) + 1e-3),
+    log(1.0 + edge / (max(magR, magB) + 1.0)));
+  var wH = 0.0;
+  var wBM: f32;
+  if (U.useHalf > 0.0) {
+    let fh0 = textureSampleLevel(flowH, samp, p0, 0.0);
+    let x3 = vec4f(log(eH + 1e-3), log(eHraw + 1e-3), log(sqrt(sqH / 25.0) + 1e-3), log(1.0 + min(length((fh0.zw - fh0.xy) * U.size) * px, 64.0)));
+    let zH = -10.7954 + dot(lg, vec4f(0.2304, 0.5179, -0.3113, -0.0556)) + 1.0813 * occ + dot(lr, vec2f(-0.1674, 0.0122))
+      + dot(x1, vec4f(0.7122, -0.1632, 0.2001, 0.5152)) + dot(x2, vec4f(-0.4487, 0.7340, -0.4703, 0.0264)) + dot(x3, vec4f(-0.1077, -0.2086, -0.1739, 1.5807));
+    let zB = -4.8153 + dot(lg, vec4f(-0.4076, 1.1175, -0.2063, -0.6876)) + 0.4815 * occ + dot(lr, vec2f(0.3710, -0.5478))
+      + dot(x1, vec4f(1.2374, 0.1904, -0.2937, -0.7232)) + dot(x2, vec4f(0.2782, 0.2644, -0.3528, 0.7092)) + dot(x3, vec4f(-0.0215, -0.0453, 0.0707, -0.0994));
+    wH = 1.0 / (1.0 + exp(-zH));
+    wBM = 1.0 / (1.0 + exp(-zB));
+  } else {
+    let z = -4.5558 + dot(lg, vec4f(-0.5027, 1.2137, -0.1363, -0.7874)) + 0.8933 * occ + dot(lr, vec2f(0.3583, -0.5895))
+      + dot(x1, vec4f(1.2700, 0.0366, -0.2750, -0.7804)) + dot(x2, vec4f(0.2947, -0.3030, -0.2767, 0.5601));
+    wBM = 1.0 / (1.0 + exp(-z));
+  }
   let conf = 1.0 - smoothstep(0.05, 0.15, min(eA, eB));
   textureStore(selOut, g.xy, vec4f(wBM, conf, wH, 1.0));
 }

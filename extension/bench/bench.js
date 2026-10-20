@@ -140,7 +140,7 @@
       for (const preset of ['fast', 'standard', 'quality']) {
         const P = S.PRESETS[preset];
         const net = await S.getRifeNet(device, P.model);
-        const j = makeJob(device, net, { ...P, hybrid: true });
+        const j = makeJob(device, net, { ...P, hybrid: true, multiscale: true });
         const { ms, times } = await timeJob(device, j.steps);
         const rms = await timeRender(device, j);
         const r = j.eng.res;
@@ -154,9 +154,9 @@
         if (preset === 'standard') {
           // optional parts at this preset
           const variants = [
+            ['半分の解像度での推論なし', { hybrid: true, multiscale: false }],
             ['ハイブリッドなし（RIFE のみ）', { hybrid: false }],
-            ['＋ 大きな動きを高精度に（推論 3 回）', { hybrid: true, anchors: true }],
-            ['＋ 半分解像度の RIFE（実験的）', { hybrid: true, multiscale: true }],
+            ['＋ 大きな動きを高精度に（推論 3 回）', { hybrid: true, multiscale: true, anchors: true }],
           ];
           obody.insertAdjacentHTML('beforeend', `<tr><td>標準（既定の設定）</td><td>${ms.toFixed(1)} ms</td>${loadCell(ms, 24)}${loadCell(ms, 30)}</tr>`);
           for (const [label, opt] of variants) {
