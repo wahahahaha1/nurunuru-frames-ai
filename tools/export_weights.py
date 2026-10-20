@@ -1,7 +1,9 @@
-"""Convert a RIFE v4.6 checkpoint (PyTorch zip, e.g. flownet_v4.6.pkl) into the extension's weight file.
+"""Convert a RIFE 4.25-family checkpoint (PyTorch zip, e.g. flownet_v4.25.pkl) into the extension's weight file.
 
 The checkpoint is read with a restricted unpickler that only rebuilds tensors (no arbitrary code runs),
-so torch is not needed: python3 export_weights.py flownet_v4.6.pkl ../extension/models/rife-v4.6.bin
+so torch is not needed:
+  python3 export_weights.py flownet_v4.25.pkl rife-4.25 ../extension/models/rife-v4.25.bin
+  python3 export_weights.py flownet_v4.25.lite.pkl rife-4.25-lite ../extension/models/rife-v4.25-lite.bin
 
 Output format (little endian):
   magic "NNFW", u32 version (1), u32 header length, header JSON, padding to 4 bytes, fp16 data.
@@ -61,7 +63,7 @@ def load_state_dict(path):
 
 
 def main():
-    src, dst = sys.argv[1], sys.argv[2]
+    src, model, dst = sys.argv[1], sys.argv[2], sys.argv[3]
     sd = load_state_dict(src)
     tensors = []
     chunks = []
@@ -71,7 +73,7 @@ def main():
         tensors.append({'name': name, 'shape': list(a.shape), 'offset': off})
         chunks.append(a.astype(np.float16).ravel())
         off += a.size
-    header = json.dumps({'model': 'rife-v4.6', 'tensors': tensors}, separators=(',', ':')).encode()
+    header = json.dumps({'model': model, 'tensors': tensors}, separators=(',', ':')).encode()
     header += b' ' * (-(12 + len(header)) % 4)
     with open(dst, 'wb') as f:
         f.write(b'NNFW' + struct.pack('<II', 1, len(header)) + header)

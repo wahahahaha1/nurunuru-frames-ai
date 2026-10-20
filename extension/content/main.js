@@ -60,11 +60,12 @@
         const device = await S.getDevice();
         if (!this.active) return;
         this.reason = 'AI モデルを読み込み中';
-        const net = await S.getRifeNet(device);
+        const params = S.engineParams(this.settings);
+        const net = await S.getRifeNet(device, params.model);
         if (!this.active) return;
         this.device = device;
         device.onuncapturederror = (e) => S.player && S.player.noteError(e.error.message);
-        this.engine = new S.Interpolator(device, net, S.engineParams(this.settings));
+        this.engine = new S.Interpolator(device, net, params);
         this.engine.onTiming = (kind, ms) => this.onTiming(kind, ms);
         this.ctx = this.overlay.canvas.getContext('webgpu');
         this.format = navigator.gpu.getPreferredCanvasFormat();
@@ -94,8 +95,20 @@
     applyEngineParams() {
       if (!this.engine) return;
       const old = this.engine.res;
-      this.engine.setParams(S.engineParams({ ...this.settings, preset: this.effectivePreset() }));
+      const params = S.engineParams({ ...this.settings, preset: this.effectivePreset() });
+      this.engine.setParams(params);
       if (this.engine.res !== old) this.flush();
+      if (params.model !== this.engine.net.model) {
+        // another model: load it (once per page), then switch
+        S.getRifeNet(this.device, params.model).then(
+          (net) => {
+            if (!this.active || !this.engine || S.engineParams({ ...this.settings, preset: this.effectivePreset() }).model !== net.model) return;
+            this.engine.setNet(net);
+            this.flush();
+          },
+          (e) => this.fail(e.message)
+        );
+      }
     }
 
     effectivePreset() {

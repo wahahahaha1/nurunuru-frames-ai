@@ -8,17 +8,14 @@
 
   const log = (s) => ($('log').textContent += s + '\n');
 
-  async function setup() {
-    const device = await S.getDevice();
-    const weights = await S.loadRifeWeights('../models/rife-v4.6.bin');
-    return { device, net: new S.RifeNet(device, weights) };
-  }
+  const MODEL_NAMES = { 'rife-4.25': 'RIFE 4.25', 'rife-4.25-lite': 'RIFE 4.25 lite' };
 
   // Inputs and outputs of one job at mw x mh (content does not change the cost).
   function makeJob(device, net, mw, mh) {
     net.configure(mw, mh);
+    const { pw, ph } = net.res;
     const tensor = (seed) => {
-      const a = new Float32Array(3 * mw * mh);
+      const a = new Float32Array(S.RifeNet.tensorSize(pw, ph));
       let x = seed;
       for (let i = 0; i < a.length; i++) {
         x = (x * 1664525 + 1013904223) >>> 0;
@@ -33,7 +30,7 @@
     const stats = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const a = tensor(1);
     const b = tensor(2);
-    const steps = net.job(a, b, { flowView: flow.createView(), maskView: mask.createView(), stats });
+    const steps = [...net.headSteps(b), ...net.job(a, b, { flowView: flow.createView(), maskView: mask.createView(), stats })];
     return { steps, destroy: () => [a, b, flow, mask, stats].forEach((r) => r.destroy()) };
   }
 
@@ -80,7 +77,7 @@
   };
 
   const KIND = { conv1: '3×3 畳み込み（残差ブロック）', conv2: '3×3 畳み込み（ストライド 2）', deconv: '転置畳み込み', other: '入力の準備・ワープ・合成' };
-  const BLOCK = ['段 1（1/8 解像度）', '段 2（1/4）', '段 3（1/2）', '段 4（等倍）'];
+  const blockName = (s, net) => (s.block < 0 ? '特徴抽出（Head）' : `段 ${s.block + 1}（1/${net.spec.scales[s.block]} 解像度）`);
 
   async function run() {
     $('run').disabled = true;
@@ -88,7 +85,7 @@
     const tbody = $('result').querySelector('tbody');
     tbody.innerHTML = '';
     try {
-      const { device, net } = await setup();
+      const device = await S.getDevice();
       let err = null;
       device.onuncapturederror = (e) => (err = err || e.error.message);
       const info = (await navigator.gpu.requestAdapter())?.info || {};
@@ -98,17 +95,20 @@
       $('result').hidden = false;
       $('note').hidden = false;
       for (const preset of ['fast', 'standard', 'quality']) {
-        const [mw, mh] = S.RifeNet.modelSize(SRC[0], SRC[1], S.PRESETS[preset].modelWidth);
+        const P = S.PRESETS[preset];
+        const net = await S.getRifeNet(device, P.model);
+        const { cw: mw, ch: mh } = S.RifeNet.modelSize(SRC[0], SRC[1], P.modelWidth, net.spec.modulo);
         const job = makeJob(device, net, mw, mh);
+        const cost = job.steps.reduce((a, s) => a + s.cost, 0);
         await timeGroups(device, [job.steps]); // warm-up (pipeline compilation, caches)
         const times = [];
         for (let i = 0; i < RUNS; i++) times.push((await timeGroups(device, [job.steps]))[0]);
         const ms = median(times);
         tbody.insertAdjacentHTML(
           'beforeend',
-          `<tr><td>${NAMES[preset]}</td><td>${mw}×${mh}</td><td>${ms.toFixed(1)} ms</td>${loadCell(ms, 24)}${loadCell(ms, 30)}${loadCell(ms, 60)}</tr>`
+          `<tr><td>${NAMES[preset]}</td><td>${MODEL_NAMES[P.model]} ${mw}×${mh}</td><td>${ms.toFixed(1)} ms</td>${loadCell(ms, 24)}${loadCell(ms, 30)}${loadCell(ms, 60)}</tr>`
         );
-        log(`${preset} ${mw}x${mh}: median ${ms.toFixed(2)} ms (${times.map((t) => t.toFixed(1)).join(', ')}) / ${(net.res.totalCost / 1e9).toFixed(1)} G 積和 → ${((2 * net.res.totalCost) / ms / 1e6).toFixed(0)} GFLOPS 相当`);
+        log(`${preset} ${mw}x${mh}: median ${ms.toFixed(2)} ms (${times.map((t) => t.toFixed(1)).join(', ')}) / ${(cost / 1e9).toFixed(1)} G 積和 → ${((2 * cost) / ms / 1e6).toFixed(0)} GFLOPS 相当`);
         if (preset === 'standard' && device.features.has('timestamp-query')) {
           const per = await timeGroups(device, job.steps.map((s) => [s]));
           const total = per.reduce((a, b) => a + b, 0);
@@ -118,7 +118,7 @@
             return [...sum].map(([k, v]) => `<tr><td>${k}</td><td>${v.toFixed(2)} ms</td><td>${((100 * v) / total).toFixed(0)}%</td></tr>`).join('');
           };
           const bd = $('breakdown').querySelector('tbody');
-          bd.innerHTML = rows((s) => KIND[s.kind]) + '<tr><td colspan="3"></td></tr>' + rows((s) => BLOCK[s.block]);
+          bd.innerHTML = rows((s) => KIND[s.kind]) + '<tr><td colspan="3"></td></tr>' + rows((s) => blockName(s, net));
           log(`standard: ${job.steps.length} dispatches, sum of single-step passes ${total.toFixed(2)} ms`);
           $('breakdown').hidden = false;
           $('bdTitle').hidden = false;
@@ -126,7 +126,6 @@
         job.destroy();
         await new Promise((r) => setTimeout(r, 50));
       }
-      net.destroy();
       if (err) log('GPU エラー: ' + err);
       log(`${navigator.userAgent}`);
     } catch (e) {

@@ -2,12 +2,14 @@
 (() => {
   const S = (globalThis.NNF = globalThis.NNF || {});
 
-  // Presets = width of the RIFE input (frames are resized to it, sides rounded to multiples of 32).
-  // The inference cost grows with the pixel count: about 10 / 23 / 40 G multiply-adds per source frame.
+  // Presets = RIFE model and the width of its input (frames are resized to it; the coarse blocks pad
+  // the sides to multiples of 64 / 128). 4.25 is the model the RIFE author recommends for most
+  // scenes (and much better than earlier ones on anime); lite has a coarser first block (1/32) and
+  // a lighter last one.
   S.PRESETS = {
-    fast: { modelWidth: 512 },
-    standard: { modelWidth: 768 },
-    quality: { modelWidth: 1024 },
+    fast: { model: 'rife-4.25-lite', modelWidth: 768 },
+    standard: { model: 'rife-4.25', modelWidth: 960 },
+    quality: { model: 'rife-4.25', modelWidth: 1280 },
   };
 
   // Tuning shared by all presets.
@@ -41,19 +43,24 @@
     return S._devicePromise;
   };
 
-  // RIFE network for a device (weights are fetched once and kept for device re-creation).
-  S.getRifeNet = function getRifeNet(device) {
-    if (S._net && S._net.device === device) return S._net.promise;
-    if (!S._weightsPromise) {
-      S._weightsPromise = S.loadRifeWeights(chrome.runtime.getURL('models/rife-v4.6.bin'));
-      S._weightsPromise.catch(() => {
-        S._weightsPromise = null;
-      });
+  // RIFE network of a model for a device (weights are fetched once and kept for device re-creation).
+  S.getRifeNet = function getRifeNet(device, model) {
+    S._weights = S._weights || new Map();
+    S._nets = S._nets || new Map();
+    const key = model;
+    const cached = S._nets.get(key);
+    if (cached && cached.device === device) return cached.promise;
+    let wp = S._weights.get(model);
+    if (!wp) {
+      const url = (globalThis.chrome && chrome.runtime && chrome.runtime.getURL ? chrome.runtime.getURL('') : '../') + S.RIFE_MODELS[model].file;
+      wp = S.loadRifeWeights(url);
+      S._weights.set(model, wp);
+      wp.catch(() => S._weights.delete(model));
     }
-    const promise = S._weightsPromise.then((w) => new S.RifeNet(device, w));
-    S._net = { device, promise };
+    const promise = wp.then((w) => new S.RifeNet(device, w));
+    S._nets.set(key, { device, promise });
     promise.catch(() => {
-      if (S._net && S._net.promise === promise) S._net = null;
+      if (S._nets.get(key) && S._nets.get(key).promise === promise) S._nets.delete(key);
     });
     return promise;
   };

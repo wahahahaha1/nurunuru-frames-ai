@@ -1,20 +1,21 @@
-// RIFE v4.6 (IFNet, Practical-RIFE by hzwer, MIT) implemented on WebGPU compute shaders.
-// One inference per source pair at timestep 0.5: four coarse-to-fine blocks (scales 8, 4, 2, 1),
-// each = block input (warp + downscale) -> 2 strided convs -> 8 residual convs -> deconv + pixel
-// shuffle -> upsample and accumulate (flow, mask). The work is returned as a list of steps (one
-// dispatch each, with a rough cost) so the caller can spread it over several display frames.
+// RIFE (IFNet, Practical-RIFE by hzwer, MIT) 4.25 family implemented on WebGPU compute shaders.
+// Per frame: Head (3 convs + deconv) -> 4 feature channels, stored in the frame tensor.
+// Per source pair, one inference at timestep 0.5: five coarse-to-fine blocks, each = block input
+// (warp + downscale) -> 2 strided convs -> 8 residual convs -> deconv + pixel shuffle -> upsample
+// into the running (flow, mask, features). The work is returned as a list of steps (one dispatch
+// each, with a key for timing) so the caller can spread it over several display frames.
 (() => {
   const S = (globalThis.NNF = globalThis.NNF || {});
   const BU = GPUBufferUsage;
 
-  const BLOCKS = [
-    { c: 192, inC: 7, scale: 8 },
-    { c: 128, inC: 12, scale: 4 },
-    { c: 96, inC: 12, scale: 2 },
-    { c: 64, inC: 12, scale: 1 },
-  ];
-  // Model input sides must be multiples of this (block 0 works at 1/8 scale, then strides 2 x 2).
-  const ALIGN = 32;
+  // scales = input downscale of each block; modulo = what the padded input sides must be multiples
+  // of (coarsest block: 1 / scale, then two stride-2 convs)
+  S.RIFE_MODELS = {
+    'rife-4.25': { file: 'models/rife-v4.25.bin', scales: [16, 8, 4, 2, 1], modulo: 64 },
+    'rife-4.25-lite': { file: 'models/rife-v4.25-lite.bin', scales: [32, 16, 8, 4, 1], modulo: 128 },
+  };
+  const NC = 13; // block output channels: flow 4, mask 1, features 8
+  const FRAME_PLANES = 7; // frame tensor: RGB + 4 Head features
 
   const CONV_CFG = {
     conv1: { stride: 1, tx: 16, ty: 8, px: 2, py: 2, ci: 4 },
@@ -27,7 +28,7 @@
   // Shader variant, workgroup grid and split-K factor of a 3x3 conv layer.
   function convPlan(L, stride, ow, oh) {
     const tiles = (cfg) => Math.ceil(ow / (cfg.tx * cfg.px)) * Math.ceil(oh / (cfg.ty * cfg.py));
-    const ncog = L.cout / 16;
+    const ncog = Math.ceil(L.cout / 16);
     let key = stride === 1 ? 'conv1' : 'conv2';
     if (stride === 1 && tiles(CONV_CFG.conv1) * ncog < TARGET_WG / 2) key = 'conv1s';
     const cfg = CONV_CFG[key];
@@ -39,7 +40,7 @@
     return { key, ks, cinPer, ncog, wg };
   }
 
-  // Split-K factor of a deconv (output 4fw x 4fh, one thread per pixel).
+  // Split-K factor of a block deconv (output 4fw x 4fh, one thread per pixel).
   function deconvPlan(cin, fw, fh) {
     const wgs = Math.ceil((fw * 4) / 16) * Math.ceil((fh * 4) / 16);
     let ks = Math.max(1, Math.min(16, Math.floor(cin / 8), Math.ceil(TARGET_WG / wgs)));
@@ -80,7 +81,7 @@
   };
 
   // Rearrange PyTorch weights into the shader layouts (see shaders.js) in one Float32Array.
-  function packWeights(tensors) {
+  function packWeights(tensors, nBlocks) {
     const parts = [];
     let size = 0; // in vec4 units
     const add = (arr) => {
@@ -94,13 +95,13 @@
       if (!t) throw new Error('モデルに ' + name + ' がありません');
       return t;
     };
+    // 3x3 conv, output channels padded to groups of 16; ResConv's beta folded into weights and bias
     const convW = (wName, bName, betaName) => {
       const w = get(wName);
       const b = get(bName).data;
       const beta = betaName ? get(betaName).data : null;
       const [cout, cin] = w.shape;
-      if (cout % 16) throw new Error('出力チャンネル数が 16 の倍数ではありません: ' + wName);
-      const groups = cout / 16;
+      const groups = Math.ceil(cout / 16);
       const W = new Float32Array(groups * cin * 9 * 16);
       for (let co = 0; co < cout; co++) {
         const g = co >> 4;
@@ -112,28 +113,46 @@
           }
         }
       }
-      const B = new Float32Array(cout);
+      const B = new Float32Array(groups * 16);
       for (let co = 0; co < cout; co++) B[co] = b[co] * (beta ? beta[co] : 1);
       return { cin, cout, wOff: add(W), bOff: add(B) };
     };
+    // block deconv [cin, 4 * NC, 4, 4] + pixel shuffle: 4 vec4 (16 slots, NC used) per (ci, sub, tap)
     const deconvW = (wName, bName) => {
-      const w = get(wName); // [cin, 24, 4, 4]
+      const w = get(wName);
       const b = get(bName).data;
-      const cin = w.shape[0];
-      const W = new Float32Array(cin * 4 * 16 * 8);
+      const [cin, cout] = w.shape;
+      if (cout !== 4 * NC) throw new Error('想定外のモデル構造です: ' + wName);
+      const W = new Float32Array(cin * 4 * 16 * 16);
       for (let ci = 0; ci < cin; ci++) {
         for (let sub = 0; sub < 4; sub++) {
           for (let tap = 0; tap < 16; tap++) {
-            const base = ((ci * 4 + sub) * 16 + tap) * 8;
-            for (let c = 0; c < 5; c++) W[base + c] = w.data[(ci * 24 + c * 4 + sub) * 16 + tap];
+            const base = ((ci * 4 + sub) * 16 + tap) * 16;
+            for (let c = 0; c < NC; c++) W[base + c] = w.data[(ci * cout + c * 4 + sub) * 16 + tap];
           }
         }
       }
-      const B = new Float32Array(32);
-      for (let sub = 0; sub < 4; sub++) for (let c = 0; c < 5; c++) B[sub * 8 + c] = b[c * 4 + sub];
+      const B = new Float32Array(4 * 16);
+      for (let sub = 0; sub < 4; sub++) for (let c = 0; c < NC; c++) B[sub * 16 + c] = b[c * 4 + sub];
       return { cin, wOff: add(W), bOff: add(B) };
     };
-    const blocks = BLOCKS.map((_, i) => {
+    // plain deconv [cin, 4, 4, 4]: one vec4 per (ci, tap)
+    const deconvPlainW = (wName, bName) => {
+      const w = get(wName);
+      const [cin, cout] = w.shape;
+      const W = new Float32Array(cin * 16 * 4);
+      for (let ci = 0; ci < cin; ci++) {
+        for (let tap = 0; tap < 16; tap++) for (let c = 0; c < cout; c++) W[(ci * 16 + tap) * 4 + c] = w.data[(ci * cout + c) * 16 + tap];
+      }
+      const B = new Float32Array(4);
+      B.set(get(bName).data);
+      return { cin, wOff: add(W), bOff: add(B) };
+    };
+    const head = {
+      convs: [0, 1, 2].map((i) => convW(`encode.cnn${i}.weight`, `encode.cnn${i}.bias`)),
+      deconv: deconvPlainW('encode.cnn3.weight', 'encode.cnn3.bias'),
+    };
+    const blocks = [...Array(nBlocks).keys()].map((i) => {
       const p = `block${i}.`;
       return {
         conv0: [convW(p + 'conv0.0.0.weight', p + 'conv0.0.0.bias'), convW(p + 'conv0.1.0.weight', p + 'conv0.1.0.bias')],
@@ -149,12 +168,16 @@
       all.set(a, o);
       o += a.length;
     }
-    return { blocks, data: all };
+    return { head, blocks, data: all };
   }
 
   class RifeNet {
     constructor(device, weights) {
+      const spec = S.RIFE_MODELS[weights.model];
+      if (!spec) throw new Error('未対応のモデルです: ' + weights.model);
       this.device = device;
+      this.model = weights.model;
+      this.spec = spec;
       const d = device;
       const W = S.WGSL;
       const comp = (code, label) =>
@@ -165,28 +188,38 @@
         conv1s: comp(W.conv(CONV_CFG.conv1s), 'rife-conv-s1-small'),
         conv2: comp(W.conv(CONV_CFG.conv2), 'rife-conv-s2'),
         reduce: comp(W.convReduce, 'rife-conv-reduce'),
-        deconv: comp(W.deconv, 'rife-deconv'),
+        deconv: comp(W.deconv(NC), 'rife-deconv'),
+        deconvPlain: comp(W.deconvPlain, 'rife-deconv-plain'),
         accum: comp(W.accum, 'rife-accum'),
         pack: comp(W.pack, 'rife-pack'),
       };
-      const { blocks, data } = packWeights(weights.tensors);
+      const { head, blocks, data } = packWeights(weights.tensors, spec.scales.length);
+      this.head = head;
       this.layers = blocks;
       this.wbuf = d.createBuffer({ size: data.byteLength, usage: BU.STORAGE | BU.COPY_DST });
       d.queue.writeBuffer(this.wbuf, 0, data);
       this.res = null;
     }
 
-    static modelSize(srcW, srcH, width) {
-      const w = Math.max(ALIGN * 4, Math.round(Math.min(width, srcW) / ALIGN) * ALIGN);
-      const h = Math.max(ALIGN * 2, Math.round((w * srcH) / srcW / ALIGN) * ALIGN);
-      return [w, h];
+    // Picture size (cw x ch, width about `width`, sides multiples of 8) and padded model input size.
+    static modelSize(srcW, srcH, width, modulo) {
+      const cw = Math.max(64, Math.round(Math.min(width, srcW) / 8) * 8);
+      const ch = Math.max(32, Math.round((cw * srcH) / srcW / 8) * 8);
+      return { cw, ch, pw: Math.ceil(cw / modulo) * modulo, ph: Math.ceil(ch / modulo) * modulo };
     }
 
-    // Allocate scratch buffers and the static part of the step list for an mw x mh model input.
-    configure(mw, mh) {
-      if (this.res && this.res.mw === mw && this.res.mh === mh) return;
+    // Floats in one frame tensor.
+    static tensorSize(pw, ph) {
+      return FRAME_PLANES * pw * ph;
+    }
+
+    // Allocate scratch buffers and the static part of the step list for a cw x ch picture.
+    configure(cw, ch) {
+      if (this.res && this.res.cw === cw && this.res.ch === ch) return;
       this.destroyResources();
       const d = this.device;
+      const pw = Math.ceil(cw / this.spec.modulo) * this.spec.modulo;
+      const ph = Math.ceil(ch / this.spec.modulo) * this.spec.modulo;
       const uniforms = [];
       const uni = (data) => {
         const b = d.createBuffer({ size: Math.max(16, data.byteLength), usage: BU.UNIFORM | BU.COPY_DST });
@@ -194,154 +227,170 @@
         uniforms.push(b);
         return b;
       };
-      const plan = BLOCKS.map((b, i) => {
-        const bw = mw / b.scale;
-        const bh = mh / b.scale;
-        const h1 = [bw / 2, bh / 2];
-        const h2 = [bw / 4, bh / 4];
-        return { ...b, i, bw, bh, h1, h2, prepCost: bw * bh * (i === 0 ? 20 : 120) };
+      const plan = this.spec.scales.map((scale, i) => {
+        const L = this.layers[i];
+        const bw = pw / scale;
+        const bh = ph / scale;
+        return { i, scale, L, bw, bh, h1: [bw / 2, bh / 2], h2: [bw / 4, bh / 4], inC: i === 0 ? 15 : 28 };
       });
+      // scratch sizes (floats)
       let maxIn = 0;
       let maxMid = 0;
       let maxFeat = 0;
       let maxPart = 0;
       let maxTmp = 0;
+      const notePart = (L, stride, ow, oh) => {
+        const c = convPlan(L, stride, ow, oh);
+        if (c.ks > 1) maxPart = Math.max(maxPart, c.ks * L.cout * ow * oh);
+      };
       for (const p of plan) {
-        const L = this.layers[p.i];
         maxIn = Math.max(maxIn, p.inC * p.bw * p.bh);
-        maxMid = Math.max(maxMid, (p.c / 2) * p.h1[0] * p.h1[1]);
-        maxFeat = Math.max(maxFeat, p.c * p.h2[0] * p.h2[1]);
-        const part = (Lc, stride, ow, oh) => {
-          const c = convPlan(Lc, stride, ow, oh);
-          if (c.ks > 1) maxPart = Math.max(maxPart, c.ks * Lc.cout * ow * oh);
-        };
-        part(L.conv0[0], 2, p.h1[0], p.h1[1]);
-        part(L.conv0[1], 2, p.h2[0], p.h2[1]);
-        part(L.res[0], 1, p.h2[0], p.h2[1]);
-        const dp = deconvPlan(L.deconv.cin, p.h2[0], p.h2[1]);
-        maxTmp = Math.max(maxTmp, dp.ks * 5 * p.h2[0] * 4 * p.h2[1] * 4);
+        maxMid = Math.max(maxMid, p.L.conv0[0].cout * p.h1[0] * p.h1[1]);
+        maxFeat = Math.max(maxFeat, p.L.conv0[1].cout * p.h2[0] * p.h2[1]);
+        notePart(p.L.conv0[0], 2, ...p.h1);
+        notePart(p.L.conv0[1], 2, ...p.h2);
+        notePart(p.L.res[0], 1, ...p.h2);
+        const dp = deconvPlan(p.L.deconv.cin, ...p.h2);
+        maxTmp = Math.max(maxTmp, dp.ks * NC * p.h2[0] * 4 * p.h2[1] * 4);
       }
+      const hw = pw / 2;
+      const hh = ph / 2;
+      notePart(this.head.convs[0], 2, hw, hh);
+      notePart(this.head.convs[1], 1, hw, hh);
       const sbuf = (n, extra = 0) => d.createBuffer({ size: Math.max(16, n * 4), usage: BU.STORAGE | extra });
       const bufs = {
         x: sbuf(maxIn),
         mid: sbuf(maxMid),
         f0: sbuf(maxFeat),
         f1: sbuf(maxFeat),
-        tmp: sbuf(maxTmp),
         part: sbuf(maxPart),
-        fm: sbuf(5 * mw * mh, BU.COPY_SRC), // COPY_SRC: read back by tests
+        tmp: sbuf(maxTmp),
+        fm: sbuf(NC * pw * ph, BU.COPY_SRC), // COPY_SRC: read back by tests
+        h0: sbuf(16 * hw * hh),
+        h1: sbuf(16 * hw * hh),
       };
-      const steps = []; // static steps (everything except the frame-dependent block inputs)
       const bg = (pipe, entries) =>
         d.createBindGroup({
           layout: pipe.getBindGroupLayout(0),
           entries: entries.map((r, i) => ({ binding: i, resource: r instanceof GPUBuffer ? { buffer: r } : r })),
         });
       // Conv layer -> 1 step, or 2 with split-K (partial sums, then reduce + bias + residual + act).
-      const convSteps = (block, L, stride, inBuf, iw, ih, outBuf, ow, oh, resBuf) => {
+      const convSteps = (key, block, L, stride, inBuf, iw, ih, outBuf, ow, oh, resBuf) => {
         const c = convPlan(L, stride, ow, oh);
         const pipe = this.pipes[c.key];
         const split = c.ks > 1;
         const u = uni(new Uint32Array([L.cin, L.cout, iw, ih, ow, oh, L.wOff, L.bOff, resBuf ? 1 : 0, 1, c.ncog, c.cinPer, split ? 1 : 0, 0, 0, 0]));
         const kind = stride === 1 ? 'conv1' : 'conv2';
-        const conv = { pipe, block, kind, bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, split ? bufs.part : outBuf]), wg: c.wg, cost: L.cin * L.cout * 9 * ow * oh };
+        const conv = { key, pipe, block, kind, bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, split ? bufs.part : outBuf]), wg: c.wg, cost: L.cin * L.cout * 9 * ow * oh };
         if (!split) return [conv];
         const n = L.cout * ow * oh;
         const ru = uni(new Uint32Array([n, ow * oh, c.ks, resBuf ? 1 : 0, L.bOff, 1, 0, 0]));
         const red = this.pipes.reduce;
-        return [conv, { pipe: red, block, kind, bg: bg(red, [ru, bufs.part, this.wbuf, resBuf || bufs.part, outBuf]), wg: [Math.ceil(n / 256), 1, 1], cost: n * c.ks }];
+        return [conv, { key: key + 'r', pipe: red, block, kind, bg: bg(red, [ru, bufs.part, this.wbuf, resBuf || bufs.part, outBuf]), wg: [Math.ceil(n / 256), 1, 1], cost: n * c.ks }];
       };
+      const steps = []; // static steps (block inputs are filled per job)
       for (const p of plan) {
-        const L = this.layers[p.i];
-        const b = p.i;
+        const { L, i: b } = p;
         p.prepIndex = steps.length;
-        steps.push(null); // block input, filled per job
-        steps.push(...convSteps(b, L.conv0[0], 2, bufs.x, p.bw, p.bh, bufs.mid, p.h1[0], p.h1[1]));
-        steps.push(...convSteps(b, L.conv0[1], 2, bufs.mid, p.h1[0], p.h1[1], bufs.f0, p.h2[0], p.h2[1]));
+        steps.push(null);
+        steps.push(...convSteps(`b${b}c0`, b, L.conv0[0], 2, bufs.x, p.bw, p.bh, bufs.mid, ...p.h1));
+        steps.push(...convSteps(`b${b}c1`, b, L.conv0[1], 2, bufs.mid, ...p.h1, bufs.f0, ...p.h2));
         let cur = bufs.f0;
         let other = bufs.f1;
-        for (const R of L.res) {
-          steps.push(...convSteps(b, R, 1, cur, p.h2[0], p.h2[1], other, p.h2[0], p.h2[1], cur));
+        L.res.forEach((R, j) => {
+          steps.push(...convSteps(`b${b}r${j}`, b, R, 1, cur, ...p.h2, other, ...p.h2, cur));
           [cur, other] = [other, cur];
-        }
+        });
         const [fw, fh] = p.h2;
         const dp = deconvPlan(L.deconv.cin, fw, fh);
         const du = uni(new Uint32Array([L.deconv.cin, fw, fh, L.deconv.wOff, L.deconv.bOff, dp.cinPer, 0, 0]));
         steps.push({
+          key: `b${b}d`,
           pipe: this.pipes.deconv,
           block: b,
           kind: 'deconv',
           bg: bg(this.pipes.deconv, [du, cur, this.wbuf, bufs.tmp]),
           wg: [Math.ceil((fw * 4) / 16), Math.ceil((fh * 4) / 16), dp.ks],
-          cost: L.deconv.cin * 20 * fw * fh * 4,
+          cost: L.deconv.cin * NC * fw * fh * 4,
         });
         const abuf = new ArrayBuffer(32);
-        new Uint32Array(abuf).set([mw, mh, fw * 4, fh * 4, 0, p.i === 0 ? 1 : 0, dp.ks, 0]);
+        new Uint32Array(abuf).set([pw, ph, fw * 4, fh * 4, 0, b === 0 ? 1 : 0, dp.ks, NC]);
         new Float32Array(abuf)[4] = p.scale;
         steps.push({
+          key: `b${b}a`,
           pipe: this.pipes.accum,
           block: b,
           kind: 'other',
           bg: bg(this.pipes.accum, [uni(abuf), bufs.tmp, bufs.fm]),
-          wg: [Math.ceil(mw / 16), Math.ceil(mh / 16), 1],
-          cost: mw * mh * 40,
+          wg: [Math.ceil(pw / 16), Math.ceil(ph / 16), 1],
+          cost: pw * ph * NC * 4 * dp.ks,
         });
         const pb = new ArrayBuffer(32);
-        new Uint32Array(pb).set([mw, mh, p.bw, p.bh, 0, p.i === 0 ? 1 : 0, 0, 0]);
+        new Uint32Array(pb).set([pw, ph, p.bw, p.bh, 0, b === 0 ? 1 : 0, 0, 0]);
         new Float32Array(pb)[4] = p.scale;
         p.prepU = uni(pb);
+        p.prepCost = p.bw * p.bh * (b === 0 ? 30 : 400);
       }
-      const packCost = mw * mh * 30;
-      let totalCost = packCost;
-      for (const s of steps) if (s) totalCost += s.cost;
-      for (const p of plan) totalCost += p.prepCost;
-      this.res = { mw, mh, plan, bufs, steps, uniforms, packU: uni(new Uint32Array([mw, mh, 0, 0])), packCost, totalCost };
+      this.res = {
+        cw, ch, pw, ph, plan, bufs, steps, uniforms, bg, convSteps, uni,
+        packU: uni(new Uint32Array([cw, ch, pw, ph])),
+        headCache: new Map(),
+      };
     }
 
-    // Full step list for the pair (tensors a -> b); the last step writes the frame's flow / mask
-    // textures and scene statistics.
+    // Head steps for a frame tensor: features into planes 3-6 (cached per tensor buffer).
+    headSteps(tensor) {
+      const r = this.res;
+      let steps = r.headCache.get(tensor);
+      if (steps) return steps;
+      const { pw, ph, bufs } = r;
+      const hw = pw / 2;
+      const hh = ph / 2;
+      const [c0, c1, c2] = this.head.convs;
+      steps = [
+        ...r.convSteps('h0', -1, c0, 2, tensor, pw, ph, bufs.h0, hw, hh),
+        ...r.convSteps('h1', -1, c1, 1, bufs.h0, hw, hh, bufs.h1, hw, hh),
+        ...r.convSteps('h2', -1, c2, 1, bufs.h1, hw, hh, bufs.h0, hw, hh),
+      ];
+      const D = this.head.deconv;
+      const eu = r.uni(new Uint32Array([D.cin, hw, hh, D.wOff, D.bOff, 3 * pw * ph, 0, 0]));
+      steps.push({
+        key: 'h3',
+        pipe: this.pipes.deconvPlain,
+        block: -1,
+        kind: 'deconv',
+        bg: r.bg(this.pipes.deconvPlain, [eu, bufs.h0, this.wbuf, tensor]),
+        wg: [Math.ceil(pw / 16), Math.ceil(ph / 16), 1],
+        cost: D.cin * 4 * 4 * pw * ph,
+      });
+      r.headCache.set(tensor, steps);
+      return steps;
+    }
+
+    // Step list for the pair (tensors a -> b, Head features already computed); the last step writes
+    // the frame's flow / mask textures and scene statistics.
     job(tensorA, tensorB, out) {
-      const d = this.device;
       const r = this.res;
       const steps = r.steps.slice();
       for (const p of r.plan) {
         steps[p.prepIndex] = {
+          key: `b${p.i}p`,
           pipe: this.pipes.prep,
           block: p.i,
           kind: 'other',
-          bg: d.createBindGroup({
-            layout: this.pipes.prep.getBindGroupLayout(0),
-            entries: [
-              { binding: 0, resource: { buffer: p.prepU } },
-              { binding: 1, resource: { buffer: tensorA } },
-              { binding: 2, resource: { buffer: tensorB } },
-              { binding: 3, resource: { buffer: r.bufs.fm } },
-              { binding: 4, resource: { buffer: r.bufs.x } },
-            ],
-          }),
+          bg: r.bg(this.pipes.prep, [p.prepU, tensorA, tensorB, r.bufs.fm, r.bufs.x]),
           wg: [Math.ceil(p.bw / 16), Math.ceil(p.bh / 16), 1],
           cost: p.prepCost,
         };
       }
       steps.push({
+        key: 'pack',
         pipe: this.pipes.pack,
-        block: 3,
+        block: r.plan.length - 1,
         kind: 'other',
-        bg: d.createBindGroup({
-          layout: this.pipes.pack.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: { buffer: r.packU } },
-            { binding: 1, resource: { buffer: r.bufs.fm } },
-            { binding: 2, resource: { buffer: tensorA } },
-            { binding: 3, resource: { buffer: tensorB } },
-            { binding: 4, resource: out.flowView },
-            { binding: 5, resource: out.maskView },
-            { binding: 6, resource: { buffer: out.stats } },
-          ],
-        }),
-        wg: [Math.ceil(r.mw / 16), Math.ceil(r.mh / 16), 1],
-        cost: r.packCost,
-        clearStats: out.stats,
+        bg: r.bg(this.pipes.pack, [r.packU, r.bufs.fm, tensorA, tensorB, out.flowView, out.maskView, out.stats]),
+        wg: [Math.ceil(r.cw / 16), Math.ceil(r.ch / 16), 1],
+        cost: r.cw * r.ch * 30,
       });
       return steps;
     }
@@ -360,5 +409,4 @@
   }
 
   S.RifeNet = RifeNet;
-  S.RIFE_ALIGN = ALIGN;
 })();

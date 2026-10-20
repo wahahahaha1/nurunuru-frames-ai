@@ -36,9 +36,9 @@
       this.seq = 0;
       this.jobs = [];
       this.chunks = 4; // chunks per inference job (pump() keeps this up to date)
-      // Measured GPU ms of each step of an inference job (layers differ a lot in efficiency, so the
-      // work is split by measured time, not by arithmetic cost). null entries = not measured yet.
-      this.stepMs = null;
+      // Measured GPU ms per step key (layers differ a lot in efficiency, so the work is split by
+      // measured time, not by arithmetic cost); empty until the first measured job completes.
+      this.stepMs = new Map();
       this.jobCount = 0;
       this.inflight = 0; // submitted inference chunks the GPU has not finished yet
       // GPU timing (sampled): onTiming('me' | 'render', ms) reports inference per source frame and render cost.
@@ -76,21 +76,44 @@
         );
     }
 
-    // GPU ms of one inference at the current model size (null until measured).
+    // GPU ms of one inference (one Head + the pair) at the current model size (null until measured).
     jobMs() {
-      return this.stepMs ? this.stepMs.reduce((a, b) => a + b, 0) : null;
+      if (!this.stepMs.size || !this.res) return null;
+      let ms = 0;
+      for (const k of this.res.jobKeys) ms += this.stepMs.get(k) || 0;
+      return ms;
     }
 
-    // Estimated GPU ms of step i of a job (before the first measurement: 1 G multiply-adds per ms).
-    stepEst(steps, i) {
-      return this.stepMs ? this.stepMs[i] : steps[i].cost / 1e6 + 0.02;
+    // Estimated GPU ms of a step (before the first measurement: 1 G multiply-adds per ms).
+    stepEst(step) {
+      const m = this.stepMs.get(step.key);
+      return m != null ? m : step.cost / 1e6 + 0.02;
     }
 
     // Fold the step times of a measured job into the running estimate and report the job time.
-    noteJobTimes(ms) {
-      if (!this.stepMs || this.stepMs.length !== ms.length) this.stepMs = ms.slice();
-      else for (let i = 0; i < ms.length; i++) this.stepMs[i] += 0.25 * (ms[i] - this.stepMs[i]);
+    noteJobTimes(steps, ms) {
+      const sum = new Map();
+      for (let i = 0; i < steps.length; i++) {
+        const [t, n] = sum.get(steps[i].key) || [0, 0];
+        sum.set(steps[i].key, [t + ms[i], n + 1]);
+      }
+      for (const [k, [t, n]] of sum) {
+        const v = t / n;
+        const old = this.stepMs.get(k);
+        this.stepMs.set(k, old == null ? v : old + 0.25 * (v - old));
+      }
       if (this.onTiming) this.onTiming('me', this.jobMs());
+    }
+
+    // Switch to another network (model change); everything is reallocated.
+    setNet(net) {
+      if (net === this.net) return;
+      this.net = net;
+      if (this.res) {
+        const { srcW, srcH } = this.res;
+        this.destroyResources();
+        this.configure(srcW, srcH);
+      }
     }
 
     setParams(params) {
@@ -112,7 +135,7 @@
       const fs = Math.min(1, p.maxFrameWidth / srcW);
       const fw = Math.max(16, Math.round(srcW * fs));
       const fh = Math.max(16, Math.round(srcH * fs));
-      const [mw, mh] = S.RifeNet.modelSize(srcW, srcH, p.modelWidth);
+      const { cw: mw, ch: mh, pw, ph } = S.RifeNet.modelSize(srcW, srcH, p.modelWidth, this.net.spec.modulo);
       this.net.configure(mw, mh);
       const uni = (data) => {
         const b = d.createBuffer({ size: Math.max(16, data.byteLength), usage: BU.UNIFORM | BU.COPY_DST });
@@ -121,7 +144,7 @@
       };
       const ingestScale = fw / srcW;
       const ingestU = uni(new Float32Array([1 / fw, 1 / fh, ingestScale < 0.75 ? 2 : 1, 0]));
-      const tensorU = uni(new Uint32Array([mw, mh, Math.max(1, Math.min(4, Math.round(fw / mw))), 0]));
+      const tensorU = uni(new Uint32Array([mw, mh, pw, ph, Math.max(1, Math.min(4, Math.round(fw / mw))), 0, 0, 0]));
       const frames = [];
       for (let s = 0; s < RING; s++) {
         const tex = d.createTexture({
@@ -133,12 +156,13 @@
           slot: s,
           tex,
           view: tex.createView(),
-          tensor: d.createBuffer({ size: 3 * mw * mh * 4, usage: BU.STORAGE }),
+          tensor: d.createBuffer({ size: S.RifeNet.tensorSize(pw, ph) * 4, usage: BU.STORAGE }),
           flow: d.createTexture({ size: [mw, mh], format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
           mask: d.createTexture({ size: [mw, mh], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
           stats: d.createBuffer({ size: 16, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC }),
           id: -1, // sequence number of the frame currently held
           hasPair: false, // RIFE result for (id-1 -> id) is complete
+          feat: false, // Head features of the current frame are submitted
           pairPrevId: -1,
         };
         fr.flowView = fr.flow.createView();
@@ -155,8 +179,10 @@
         frames.push(fr);
       }
       this.jobs = [];
-      this.stepMs = null;
-      this.res = { srcW, srcH, fw, fh, mw, mh, ingestU, tensorU, frames, next: 0 };
+      this.stepMs = new Map();
+      // step keys of a typical job (one Head + the pair), for jobMs()
+      const jobKeys = [...this.net.headSteps(frames[0].tensor), ...this.net.job(frames[0].tensor, frames[1].tensor, frames[1])].map((st) => st.key);
+      this.res = { srcW, srcH, fw, fh, mw, mh, pw, ph, ingestU, tensorU, frames, next: 0, jobKeys };
       return true;
     }
 
@@ -199,6 +225,7 @@
       f.id = ++this.seq;
       f.hasPair = false;
       f.pairPrevId = -1;
+      f.feat = false;
       const ext = d.importExternalTexture({ source });
       const enc = d.createCommandEncoder();
       const bg = d.createBindGroup({
@@ -219,7 +246,7 @@
       const cp = enc.beginComputePass();
       cp.setPipeline(this.tensorPipe);
       cp.setBindGroup(0, f.tensorBG);
-      cp.dispatchWorkgroups(Math.ceil(r.mw / 16), Math.ceil(r.mh / 16));
+      cp.dispatchWorkgroups(Math.ceil(r.pw / 16), Math.ceil(r.ph / 16));
       cp.end();
       enc.clearBuffer(f.stats);
       d.queue.submit([enc.finish()]);
@@ -229,9 +256,21 @@
 
     // Queue the inference for the pair (a -> b); pump() submits it.
     queueJob(a, b) {
-      const steps = this.net.job(a.tensor, b.tensor, b);
       const measure = this.jobCount++ % MEASURE_EVERY === 0;
-      this.jobs.push({ a, aId: a.id, b, bId: b.id, steps, next: 0, measure, ms: measure ? new Array(steps.length).fill(0) : null, pending: 0 });
+      this.jobs.push({ a, aId: a.id, b, bId: b.id, steps: null, next: 0, measure, ms: null, pending: 0, marks: [] });
+    }
+
+    // Steps of a job, built when it starts: Head features of a and b where missing, then the pair.
+    startJob(job) {
+      const steps = [];
+      for (const f of [job.a, job.b]) {
+        if (f.feat) continue;
+        steps.push(...this.net.headSteps(f.tensor));
+        job.marks.push([steps.length, f]); // features of f are submitted once steps[0, n) are
+      }
+      steps.push(...this.net.job(job.a.tensor, job.b.tensor, job.b));
+      job.steps = steps;
+      if (job.measure) job.ms = new Array(steps.length).fill(0);
     }
 
     // A frame record stays usable until its slot is reused.
@@ -255,15 +294,16 @@
       while (this.jobs.length > 2) this.jobs.splice(this.jobs[0].next > 0 ? 1 : 0, 1);
       if (!this.jobs.length || !this.res || this.inflight >= MAX_INFLIGHT) return;
       const job = this.jobs[0];
+      if (!job.steps) this.startJob(job);
       const steps = job.steps;
       let jobMs = 0;
-      for (let i = 0; i < steps.length; i++) jobMs += this.stepEst(steps, i);
+      for (const st of steps) jobMs += this.stepEst(st);
       const maxChunks = Math.max(1, Math.floor((0.75 * srcMs) / vsyncMs));
       const target = Math.max(CHUNK_SHARE * vsyncMs, jobMs / maxChunks);
       // chunk count of a whole job at this target (for the player's latency allowance)
       let chunks = 1;
       for (let i = 0, acc = 0; i < steps.length; i++) {
-        const e = this.stepEst(steps, i);
+        const e = this.stepEst(steps[i]);
         if (acc > 0 && acc + e > target) {
           chunks++;
           acc = 0;
@@ -274,7 +314,7 @@
       const first = job.next;
       let last = first;
       for (let acc = 0; last < steps.length; last++) {
-        const e = this.stepEst(steps, last);
+        const e = this.stepEst(steps[last]);
         if (last > first && acc + e > target) break;
         acc += e;
       }
@@ -297,6 +337,7 @@
       }
       cp.end();
       job.next = last;
+      for (const [n, f] of job.marks) if (last >= n) f.feat = true;
       let read = null;
       if (timed) {
         const size = 16 * (last - first);
@@ -313,7 +354,7 @@
       }
       d.queue.submit([enc.finish()]);
       const done = () => {
-        if (--job.pending === 0 && job.next === steps.length && job.ms) this.noteJobTimes(job.ms);
+        if (--job.pending === 0 && job.next === steps.length && job.ms) this.noteJobTimes(steps, job.ms);
       };
       if (job.ms) job.pending++;
       if (read) {
