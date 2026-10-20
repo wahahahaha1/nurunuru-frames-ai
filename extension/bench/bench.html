@@ -8,16 +8,21 @@
 <body>
 <main>
   <h1>NuruNuru Frames AI ベンチマーク</h1>
-  <p class="lead">この PC の GPU で、AI（RIFE）の推論 1 回にかかる時間をプリセットごとに測ります。1080p（16:9）の動画を想定しています。測定中は動画の再生などを止めてください。</p>
+  <p class="lead">この PC の GPU で、補間の処理（AI の推論・ブロックマッチング・選択マップ）1 回にかかる時間と、補間フレーム 1 枚の描画時間をプリセットごとに測ります。1080p（16:9）の動画を想定しています。測定中は動画の再生などを止めてください。</p>
   <button id="run">測定する</button>
   <div id="gpu" class="muted"></div>
   <table id="result" hidden>
     <thead>
-      <tr><th>プリセット</th><th>推論解像度</th><th>推論 1 回</th><th>24fps 動画</th><th>30fps 動画</th><th>60fps 動画</th></tr>
+      <tr><th>プリセット</th><th>推論解像度</th><th>処理 1 回</th><th>12 枚/秒</th><th>24 枚/秒</th><th>30 枚/秒</th><th>60 枚/秒</th><th>描画 1 枚</th></tr>
     </thead>
     <tbody></tbody>
   </table>
-  <p id="note" class="muted" hidden>「24fps 動画」などの列は、その動画を補間するときに推論が GPU 時間の何 % を使うかの目安です（描画のぶんは含みません）。拡張機能は 70% を超えるとプリセットを自動で下げます。</p>
+  <p id="note" class="muted" hidden>「24 枚/秒」などの列は、1 秒にその枚数の絵（2 コマ打ちのアニメなら 12 枚、24fps の映画なら 24 枚）を補間するときに、処理が GPU 時間の何 % を使うかの目安です。描画はこれとは別に、出力フレームごと（144Hz なら 1 秒に 144 回）にかかります。拡張機能は合計が 70% を超えると自動で軽くします。</p>
+  <h2 id="optTitle" hidden>オプションのコスト（標準プリセット）</h2>
+  <table id="options" hidden>
+    <thead><tr><th>設定</th><th>処理 1 回</th><th>24 枚/秒</th><th>30 枚/秒</th></tr></thead>
+    <tbody></tbody>
+  </table>
   <h2 id="bdTitle" hidden>内訳（標準プリセット）</h2>
   <table id="breakdown" hidden><tbody></tbody></table>
   <pre id="log"></pre>
@@ -25,6 +30,8 @@
 <script src="../content/engine/gpu.js"></script>
 <script src="../content/engine/shaders.js"></script>
 <script src="../content/engine/rife.js"></script>
+<script src="../content/engine/bm.js"></script>
+<script src="../content/engine/interpolator.js"></script>
 <script src="bench.js"></script>
 </body>
 </html>

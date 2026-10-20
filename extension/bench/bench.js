@@ -1,37 +1,43 @@
-// Inference benchmark: RIFE job GPU time per preset for a 1920x1080 source, plus a per-kernel breakdown.
+// Benchmark: GPU time of one interpolation job (Head + block matching + RIFE + selection map, as the
+// player runs it) per preset for a 1920x1080 source, the cost of the optional extras, the render
+// cost per output frame, and a per-kernel breakdown.
 (() => {
   const S = globalThis.NNF;
   const $ = (id) => document.getElementById(id);
   const NAMES = { fast: '速度優先', standard: '標準', quality: '高画質' };
-  const SRC = [1920, 1080];
+  const MODEL_NAMES = { 'rife-4.25': 'RIFE 4.25', 'rife-4.25-lite': 'RIFE 4.25 lite' };
+  const q = new URLSearchParams(location.search);
+  const SRC = [+(q.get('w') || 1920), +(q.get('h') || 1080)]; // smaller sizes for quick checks
   const RUNS = 8;
 
   const log = (s) => ($('log').textContent += s + '\n');
 
-  const MODEL_NAMES = { 'rife-4.25': 'RIFE 4.25', 'rife-4.25-lite': 'RIFE 4.25 lite' };
-
-  // Inputs and outputs of one job at mw x mh (content does not change the cost).
-  function makeJob(device, net, mw, mh) {
-    net.configure(mw, mh);
-    const { pw, ph } = net.res;
-    const tensor = (seed) => {
-      const a = new Float32Array(S.RifeNet.tensorSize(pw, ph));
+  // An engine for the source size with two synthetic frames ingested; returns the steps of the job
+  // between them (one Head, as in steady playback) and the two frame records.
+  function makeJob(device, net, params) {
+    const eng = new S.Interpolator(device, net, params);
+    eng.configure(SRC[0], SRC[1]);
+    const r = eng.res;
+    const frame = (seed) => {
+      const px = new Uint8Array(r.fw * r.fh * 4);
       let x = seed;
-      for (let i = 0; i < a.length; i++) {
+      for (let i = 0; i < px.length; i++) {
         x = (x * 1664525 + 1013904223) >>> 0;
-        a[i] = (x >>> 8) / 16777216;
+        px[i] = x >>> 24;
       }
-      const b = device.createBuffer({ size: a.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-      device.queue.writeBuffer(b, 0, a);
-      return b;
+      return px;
     };
-    const flow = device.createTexture({ size: [mw, mh], format: 'rgba16float', usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING });
-    const mask = device.createTexture({ size: [mw, mh], format: 'rgba8unorm', usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING });
-    const stats = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    const a = tensor(1);
-    const b = tensor(2);
-    const steps = [...net.headSteps(b), ...net.job(a, b, { flowView: flow.createView(), maskView: mask.createView(), stats })];
-    return { steps, destroy: () => [a, b, flow, mask, stats].forEach((r) => r.destroy()) };
+    const put = (seed, prev) => {
+      device.queue.writeTexture({ texture: r.frames[r.next].tex }, frame(seed), { bytesPerRow: r.fw * 4 }, [r.fw, r.fh]);
+      return eng.process(device.createCommandEncoder(), prev, false);
+    };
+    const a = put(1, null);
+    const b = put(2, a);
+    a.feat = true; // its Head ran with the previous pair
+    a.featH = true;
+    const job = eng.jobs[0];
+    eng.startJob(job);
+    return { eng, a, b, job, steps: job.steps };
   }
 
   // GPU ms of each group of steps (one compute pass per group, timestamp queries when available).
@@ -70,20 +76,57 @@
   }
 
   const median = (a) => [...a].sort((x, y) => x - y)[a.length >> 1];
+
+  async function timeJob(device, steps) {
+    await timeGroups(device, [steps]); // warm-up (pipeline compilation, caches)
+    const times = [];
+    for (let i = 0; i < RUNS; i++) times.push((await timeGroups(device, [steps]))[0]);
+    return { ms: median(times), times };
+  }
+
+  // GPU ms of drawing one 1080p output frame of the (now computed) pair.
+  async function timeRender(device, j) {
+    const { eng, a, b, job } = j;
+    b.hasPair = true;
+    b.hasSel = job.useBM;
+    b.hasHalf = job.useHalf;
+    b.pairPrevId = a.id;
+    b.pairDrawId = a.drawId;
+    const out = device.createTexture({ size: SRC, format: 'rgba8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT });
+    const times = [];
+    eng.onTiming = (kind, ms) => kind === 'render' && times.push(ms);
+    for (let i = 0; i < 60; i++) {
+      eng.render(out.createView(), 'rgba8unorm', [0, 0, ...SRC], a, b, 0.3 + (i % 5) * 0.1, {});
+      await device.queue.onSubmittedWorkDone();
+    }
+    await new Promise((r) => setTimeout(r, 100));
+    out.destroy();
+    return times.length ? median(times) : null;
+  }
+
   const loadCell = (ms, fps) => {
     const pct = (ms * fps) / 10;
     const cls = pct <= 50 ? 'good' : pct <= 70 ? 'warn' : 'bad';
     return `<td class="${cls}">${pct.toFixed(0)}%</td>`;
   };
 
-  const KIND = { conv1: '3×3 畳み込み（残差ブロック）', conv2: '3×3 畳み込み（ストライド 2）', deconv: '転置畳み込み', other: '入力の準備・ワープ・合成' };
-  const blockName = (s, net) => (s.block < 0 ? '特徴抽出（Head）' : `段 ${s.block + 1}（1/${net.spec.scales[s.block]} 解像度）`);
+  const KIND = {
+    conv1: '3×3 畳み込み（残差ブロック）',
+    conv2: '3×3 畳み込み（ストライド 2）',
+    deconv: '転置畳み込み',
+    other: '入力の準備・ワープ・合成',
+    bm: 'ブロックマッチング・選択マップ',
+  };
+  const blockName = (s, net) =>
+    s.block === -2 ? 'ブロックマッチング・選択マップ' : s.block < 0 ? '特徴抽出（Head）' : `RIFE 段 ${s.block + 1}（1/${net.spec.scales[s.block]} 解像度）`;
 
   async function run() {
     $('run').disabled = true;
     $('log').textContent = '';
     const tbody = $('result').querySelector('tbody');
+    const obody = $('options').querySelector('tbody');
     tbody.innerHTML = '';
+    obody.innerHTML = '';
     try {
       const device = await S.getDevice();
       let err = null;
@@ -97,33 +140,49 @@
       for (const preset of ['fast', 'standard', 'quality']) {
         const P = S.PRESETS[preset];
         const net = await S.getRifeNet(device, P.model);
-        const { cw: mw, ch: mh } = S.RifeNet.modelSize(SRC[0], SRC[1], P.modelWidth, net.spec.modulo);
-        const job = makeJob(device, net, mw, mh);
-        const cost = job.steps.reduce((a, s) => a + s.cost, 0);
-        await timeGroups(device, [job.steps]); // warm-up (pipeline compilation, caches)
-        const times = [];
-        for (let i = 0; i < RUNS; i++) times.push((await timeGroups(device, [job.steps]))[0]);
-        const ms = median(times);
+        const j = makeJob(device, net, { ...P, hybrid: true });
+        const { ms, times } = await timeJob(device, j.steps);
+        const rms = await timeRender(device, j);
+        const r = j.eng.res;
         tbody.insertAdjacentHTML(
           'beforeend',
-          `<tr><td>${NAMES[preset]}</td><td>${MODEL_NAMES[P.model]} ${mw}×${mh}</td><td>${ms.toFixed(1)} ms</td>${loadCell(ms, 24)}${loadCell(ms, 30)}${loadCell(ms, 60)}</tr>`
+          `<tr><td>${NAMES[preset]}</td><td>${MODEL_NAMES[P.model]} ${r.mw}×${r.mh}</td><td>${ms.toFixed(1)} ms</td>` +
+            `${loadCell(ms, 12)}${loadCell(ms, 24)}${loadCell(ms, 30)}${loadCell(ms, 60)}<td>${rms == null ? '-' : rms.toFixed(2) + ' ms'}</td></tr>`
         );
-        log(`${preset} ${mw}x${mh}: median ${ms.toFixed(2)} ms (${times.map((t) => t.toFixed(1)).join(', ')}) / ${(cost / 1e9).toFixed(1)} G 積和 → ${((2 * cost) / ms / 1e6).toFixed(0)} GFLOPS 相当`);
-        if (preset === 'standard' && device.features.has('timestamp-query')) {
-          const per = await timeGroups(device, job.steps.map((s) => [s]));
-          const total = per.reduce((a, b) => a + b, 0);
-          const rows = (label) => {
-            const sum = new Map();
-            job.steps.forEach((s, i) => sum.set(label(s), (sum.get(label(s)) || 0) + per[i]));
-            return [...sum].map(([k, v]) => `<tr><td>${k}</td><td>${v.toFixed(2)} ms</td><td>${((100 * v) / total).toFixed(0)}%</td></tr>`).join('');
-          };
-          const bd = $('breakdown').querySelector('tbody');
-          bd.innerHTML = rows((s) => KIND[s.kind]) + '<tr><td colspan="3"></td></tr>' + rows((s) => blockName(s, net));
-          log(`standard: ${job.steps.length} dispatches, sum of single-step passes ${total.toFixed(2)} ms`);
-          $('breakdown').hidden = false;
-          $('bdTitle').hidden = false;
+        const cost = j.steps.reduce((a, s) => a + s.cost, 0);
+        log(`${preset} ${r.mw}x${r.mh}: job median ${ms.toFixed(2)} ms (${times.map((t) => t.toFixed(1)).join(', ')}), ${j.steps.length} dispatches, ~${(cost / 1e9).toFixed(1)} G MAC; render ${rms == null ? '-' : rms.toFixed(3)} ms`);
+        if (preset === 'standard') {
+          // optional parts at this preset
+          const variants = [
+            ['ハイブリッドなし（RIFE のみ）', { hybrid: false }],
+            ['＋ 大きな動きを高精度に（推論 3 回）', { hybrid: true, anchors: true }],
+            ['＋ 半分解像度の RIFE（実験的）', { hybrid: true, multiscale: true }],
+          ];
+          obody.insertAdjacentHTML('beforeend', `<tr><td>標準（既定の設定）</td><td>${ms.toFixed(1)} ms</td>${loadCell(ms, 24)}${loadCell(ms, 30)}</tr>`);
+          for (const [label, opt] of variants) {
+            const v = makeJob(device, net, { ...P, ...opt });
+            const t = await timeJob(device, v.steps);
+            obody.insertAdjacentHTML('beforeend', `<tr><td>${label}</td><td>${t.ms.toFixed(1)} ms</td>${loadCell(t.ms, 24)}${loadCell(t.ms, 30)}</tr>`);
+            v.eng.destroy();
+          }
+          $('options').hidden = false;
+          $('optTitle').hidden = false;
+          if (device.features.has('timestamp-query')) {
+            const per = await timeGroups(device, j.steps.map((s) => [s]));
+            const total = per.reduce((a, b) => a + b, 0);
+            const rows = (label) => {
+              const sum = new Map();
+              j.steps.forEach((s, i) => sum.set(label(s), (sum.get(label(s)) || 0) + per[i]));
+              return [...sum].map(([k, v]) => `<tr><td>${k}</td><td>${v.toFixed(2)} ms</td><td>${((100 * v) / total).toFixed(0)}%</td></tr>`).join('');
+            };
+            const bd = $('breakdown').querySelector('tbody');
+            bd.innerHTML = rows((s) => KIND[s.kind]) + '<tr><td colspan="3"></td></tr>' + rows((s) => blockName(s, net));
+            log(`standard: sum of single-step passes ${total.toFixed(2)} ms`);
+            $('breakdown').hidden = false;
+            $('bdTitle').hidden = false;
+          }
         }
-        job.destroy();
+        j.eng.destroy();
         await new Promise((r) => setTimeout(r, 50));
       }
       if (err) log('GPU エラー: ' + err);
