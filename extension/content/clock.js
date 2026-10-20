@@ -2,9 +2,14 @@
 // source frame duration and a smoothed media clock, and decides which pair (a, b) and phase t to
 // show at a given display time. Output runs `delay` media-seconds behind the video so that the
 // next source frame is always available.
+// Repeated drawings (anime on twos / threes): frames whose engine record says dupState 'dup' are
+// skipped, so pairs span distinct drawings, and the delay grows to the longest recent span.
 (() => {
   const S = (globalThis.NNF = globalThis.NNF || {});
-  const KEEP = 5; // must stay below the interpolator's ring size (6)
+  const KEEP = 7; // must stay below the interpolator's ring size (8)
+  const MAX_SPAN = 3.5; // longest span between drawings that is interpolated over, in source frames
+
+  const stateOf = (rec) => (rec.f ? rec.f.dupState || 'distinct' : 'distinct');
 
   class FrameClock {
     constructor() {
@@ -20,6 +25,8 @@
     // Drop frames and clock sync (seek, stall, tab switch). The frame-rate estimate survives.
     reset() {
       this.frames = [];
+      this.spans = []; // recent media-time spans between distinct drawings
+      this.lastSpanEnd = -Infinity;
       this.offset = null; // media = offset + rate * wallSeconds
       this.latency = null; // expectedDisplayTime - callback time (ms)
       this.lastPresented = null;
@@ -84,27 +91,56 @@
       this.rate = rate;
     }
 
-    // Output delay in media seconds: one source frame + one display frame of jitter allowance
+    // Longest recent span between distinct drawings (one source frame for ordinary video).
+    get spanDur() {
+      const cap = MAX_SPAN * this.frameDur;
+      let m = this.frameDur;
+      for (const s of this.spans) if (s <= cap) m = Math.max(m, s);
+      return m;
+    }
+
+    // Output delay in media seconds: one drawing span + one display frame of jitter allowance
     // + the inference pipeline latency + whatever extra the underrun detector has added.
     get delay() {
-      return this.frameDur + this.vsync + 0.001 + this.extra + this.margin;
+      return this.spanDur + this.vsync + 0.001 + this.extra + this.margin;
+    }
+
+    // Distinct drawings among the kept frames (records whose duplicate test is still pending are left
+    // out until it resolves; a drawing that started before the oldest kept frame is represented by
+    // that frame); records new spans between them.
+    distinct() {
+      const out = this.frames.filter((r, i) => stateOf(r) === 'distinct' || (i === 0 && stateOf(r) === 'dup'));
+      for (let i = 1; i < out.length; i++) {
+        if (out[i].m > this.lastSpanEnd) {
+          this.spans.push(out[i].m - out[i - 1].m);
+          if (this.spans.length > 12) this.spans.shift();
+          this.lastSpanEnd = out[i].m;
+        }
+      }
+      return out;
     }
 
     // Pick what to show at display time displayMs. Returns { a, b, t } or null.
     pick(displayMs) {
-      const fr = this.frames;
+      const all = this.frames;
+      if (!all.length) return null;
+      const fr = this.distinct();
       if (!fr.length) return null;
       const last = fr[fr.length - 1];
       if (this.offset == null || fr.length < 2) return { a: last, b: last, t: 0, hold: true };
       const target = this.offset + (this.rate * displayMs) / 1000 - this.delay;
       if (target >= last.m) {
-        return { a: last, b: last, t: 0, hold: true, late: target - last.m, target };
+        // late only when even the newest frame (repeat or not) is behind the target
+        const newest = all[all.length - 1].m;
+        return { a: last, b: last, t: 0, hold: true, late: target > newest ? target - newest : 0, target };
       }
       for (let i = fr.length - 2; i >= 0; i--) {
         if (fr[i].m <= target) {
           const a = fr[i];
           const b = fr[i + 1];
-          return { a, b, t: Math.min(1, Math.max(0, (target - a.m) / (b.m - a.m))), target };
+          // after a long still, hold the drawing and move only over the last usual span
+          const start = Math.max(a.m, b.m - this.spanDur);
+          return { a, b, t: Math.min(1, Math.max(0, (target - start) / (b.m - start))), target };
         }
       }
       return { a: fr[0], b: fr[0], t: 0, hold: true, target };

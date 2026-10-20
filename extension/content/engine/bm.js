@@ -356,6 +356,38 @@ fn med9(a: array<f32, 9>) -> f32 {
 }
 `;
 
+  // Duplicate-frame test (anime drawn on twos / threes, repeated frames): counts the 8x8 blocks of a
+  // coarse luma level whose mean absolute difference to the previous frame exceeds a threshold.
+  // A frame with no such block is a repeat of the previous drawing (codec noise stays below it,
+  // while even a small real change, like a mouth, makes at least one block exceed it).
+  const diff = /* wgsl */ `
+struct XU { w: u32, h: u32, thr: f32, pad: u32 };
+@group(0) @binding(0) var<uniform> U: XU;
+@group(0) @binding(1) var<storage, read> la: array<f32>;
+@group(0) @binding(2) var<storage, read> lb: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outC: array<atomic<u32>, 4>;
+
+var<workgroup> part: array<f32, 64>;
+
+@compute @workgroup_size(8, 8) fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u, @builtin(local_invocation_index) tid: u32) {
+  let x = wg.x * 8u + lid.x;
+  let y = wg.y * 8u + lid.y;
+  var d = 0.0;
+  if (x < U.w && y < U.h) { d = abs(la[y * U.w + x] - lb[y * U.w + x]); }
+  part[tid] = d;
+  workgroupBarrier();
+  for (var s = 32u; s > 0u; s = s >> 1u) {
+    if (tid < s) { part[tid] += part[tid + s]; }
+    workgroupBarrier();
+  }
+  if (tid == 0u) {
+    atomicAdd(&outC[1], 1u);
+    if (part[0] / 64.0 > U.thr) { atomicAdd(&outC[0], 1u); }
+  }
+}
+`;
+  const DIFF_THRESHOLD = 0.012; // mean |luma difference| of an 8x8 block (0..1) that counts as a change
+
   class BlockMatcher {
     constructor(device, sampler) {
       this.device = device;
@@ -367,6 +399,7 @@ fn med9(a: array<f32, 9>) -> f32 {
       this.downPipe = comp(downsample, 'bm-downsample');
       this.mePipe = comp(motion, 'bm-motion');
       this.finPipe = comp(finalize, 'bm-finalize');
+      this.diffPipe = comp(diff, 'bm-diff');
       this.zeroBuf = d.createBuffer({ size: 64, usage: BU.STORAGE });
       this.res = null;
     }
@@ -420,6 +453,13 @@ fn med9(a: array<f32, 9>) -> f32 {
         );
       }
       const finU = uni(new Uint32Array([nbx[0], nby[0], mw, mh]));
+      // duplicate test on the level closest to 240 px wide
+      let dl = 0;
+      while (dl + 1 < levels && lw[dl] > 320) dl++;
+      const xbuf = new ArrayBuffer(16);
+      new Uint32Array(xbuf).set([lw[dl], lh[dl]]);
+      new Float32Array(xbuf)[2] = DIFF_THRESHOLD;
+      const diffU = uni(xbuf);
       for (const fr of frames) {
         const bm = {
           luma: lw.map((w, k) => d.createBuffer({ size: w * lh[k] * 4, usage: BU.STORAGE })),
@@ -429,6 +469,7 @@ fn med9(a: array<f32, 9>) -> f32 {
           fieldG: d.createTexture({ size: [nbx[0], nby[0]], format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
           hasPair: false, // fields for (id-1 -> id) are submitted
           pairPrevId: -1,
+          diff: d.createBuffer({ size: 16, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC }),
         };
         bm.fieldFView = bm.fieldF.createView();
         bm.fieldGView = bm.fieldG.createView();
@@ -456,7 +497,48 @@ fn med9(a: array<f32, 9>) -> f32 {
         }
         fr.bm = bm;
       }
-      this.res = { mw, mh, levels, lw, lh, nbx, nby, meU, finU, uniforms, frames };
+      this.res = { mw, mh, levels, lw, lh, nbx, nby, meU, finU, diffU, dl, uniforms, frames };
+    }
+
+    // Encode the duplicate test of frame b against a (after both luma pyramids); b.bm.diff gets
+    // [changed blocks, blocks]. Clear the buffer before the pass (clearDiff).
+    clearDiff(enc, b) {
+      enc.clearBuffer(b.bm.diff);
+    }
+
+    encodeDiff(cp, a, b) {
+      const r = this.res;
+      const k = r.dl;
+      cp.setPipeline(this.diffPipe);
+      cp.setBindGroup(
+        0,
+        this.device.createBindGroup({
+          layout: this.diffPipe.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: r.diffU } },
+            { binding: 1, resource: { buffer: a.bm.luma[k] } },
+            { binding: 2, resource: { buffer: b.bm.luma[k] } },
+            { binding: 3, resource: { buffer: b.bm.diff } },
+          ],
+        })
+      );
+      cp.dispatchWorkgroups(Math.ceil(r.lw[k] / 8), Math.ceil(r.lh[k] / 8));
+    }
+
+    // Read the duplicate test of b (after encodeDiff was submitted): resolves to true for a repeat.
+    async readDup(b) {
+      const d = this.device;
+      const rb = d.createBuffer({ size: 16, usage: BU.COPY_DST | BU.MAP_READ });
+      const enc = d.createCommandEncoder();
+      enc.copyBufferToBuffer(b.bm.diff, 0, rb, 0, 16);
+      d.queue.submit([enc.finish()]);
+      try {
+        await rb.mapAsync(GPUMapMode.READ);
+        const v = new Uint32Array(rb.getMappedRange().slice(0));
+        return v[1] > 0 && v[0] === 0;
+      } finally {
+        rb.destroy();
+      }
     }
 
     destroyResources() {
@@ -466,6 +548,7 @@ fn med9(a: array<f32, 9>) -> f32 {
         if (!bm) continue;
         bm.fieldF.destroy();
         bm.fieldG.destroy();
+        bm.diff.destroy();
         for (const b of [...bm.luma, ...bm.vecF, ...bm.vecG]) b.destroy();
         fr.bm = null;
       }

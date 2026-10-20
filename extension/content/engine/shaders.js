@@ -535,8 +535,9 @@ fn bmInterp(p: vec2f, t: f32) -> vec4f {
   // Per pair, on the mid-time grid (picture size): which motion to trust where. Compares, averaged
   // over a 3x3 neighbourhood, how well each explains the two frames at t = 0.5 (photometric error of
   // its two warps): r = weight of block matching (only where it is clearly better and itself
-  // consistent; occlusions, where both disagree, stay with RIFE and its mask), g = confidence (low
-  // where both disagree).
+  // consistent), g = confidence (low where both disagree). Where RIFE's mask clearly prefers one
+  // frame (occlusion: the other warp is expected to disagree) its error does not count, and block
+  // matching is not used.
   const select = /* wgsl */ `
 struct SU { fieldScale: vec2f, size: vec2f };
 @group(0) @binding(0) var<uniform> U: SU;
@@ -547,6 +548,7 @@ struct SU { fieldScale: vec2f, size: vec2f };
 @group(0) @binding(5) var fieldF: texture_2d<f32>;
 @group(0) @binding(6) var fieldG: texture_2d<f32>;
 @group(0) @binding(7) var selOut: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(8) var maskT: texture_2d<f32>;
 
 fn A(p: vec2f) -> vec3f { return textureSampleLevel(texA, samp, p, 0.0).rgb; }
 fn B(p: vec2f) -> vec3f { return textureSampleLevel(texB, samp, p, 0.0).rgb; }
@@ -557,17 +559,35 @@ ${bmInterp}
   let p0 = (vec2f(g.xy) + 0.5) / U.size;
   var eA = 0.0;
   var eB = 0.0;
+  var occ = 0.0;
   for (var dy = -1; dy <= 1; dy++) {
     for (var dx = -1; dx <= 1; dx++) {
       let p = p0 + vec2f(f32(dx), f32(dy)) / U.size;
       let f = textureSampleLevel(flowT, samp, p, 0.0);
-      eA += abs(lum(A(p + f.xy)) - lum(B(p + f.zw)));
+      let side = abs(2.0 * textureSampleLevel(maskT, samp, p, 0.0).r - 1.0); // 1 = one frame only
+      eA += abs(lum(A(p + f.xy)) - lum(B(p + f.zw))) * (1.0 - side);
+      occ = max(occ, side);
       eB += bmInterp(p, 0.5).w;
     }
   }
   eA /= 9.0;
   eB /= 9.0;
-  let wBM = smoothstep(0.0005, 0.004, eA - eB) * (1.0 - smoothstep(0.03, 0.08, eB));
+  // motion boundaries (either motion varies by more than a pixel within +-4 px): block matching's
+  // blocks straddle them, so RIFE keeps them
+  var lo = vec4f(1e9);
+  var hi = vec4f(-1e9);
+  for (var dy = -2; dy <= 2; dy++) {
+    for (var dx = -2; dx <= 2; dx++) {
+      let p = p0 + vec2f(f32(dx), f32(dy)) * 2.0 / U.size;
+      let f = textureSampleLevel(flowT, samp, p, 0.0);
+      let m = vec4f(f.zw - f.xy, Fb(p).xy) * vec4f(U.size, U.size);
+      lo = min(lo, m);
+      hi = max(hi, m);
+    }
+  }
+  let spread = max(max(hi.x - lo.x, hi.y - lo.y), max(hi.z - lo.z, hi.w - lo.w));
+  let wBM = smoothstep(0.0005, 0.004, eA - eB) * (1.0 - smoothstep(0.03, 0.08, eB)) * (1.0 - smoothstep(0.5, 0.8, occ))
+    * (1.0 - smoothstep(1.0, 2.5, spread));
   let conf = 1.0 - smoothstep(0.05, 0.15, min(eA, eB));
   textureStore(selOut, g.xy, vec4f(wBM, conf, 0.0, 1.0));
 }
@@ -581,7 +601,7 @@ ${bmInterp}
   // this is exactly RIFE's output.
   // With block matching (hybrid > 0) its result replaces RIFE's where the selection map says so.
   // Masking: where neither motion is trusted, fall back towards the nearer original frame (no ghosting).
-  // mode: 0 interpolate, 1 frame A, 2 frame B, 3 plain blend, 4 flow visualisation
+  // mode: 0 interpolate, 1 frame A, 2 frame B, 3 plain blend, 4 flow visualisation, 5 selection map
   const render = fullscreenVS + /* wgsl */ `
 struct RU {
   rect: vec4f,
@@ -662,6 +682,12 @@ fn interp(p: vec2f, t: f32) -> vec3f {
       let v = f.zw - f.xy;
       let m = clamp(length(v) * 25.0, 0.0, 1.0);
       col = mix(vec3f(lum(A(p))), hue(atan2(v.y, v.x) / 6.2831853 + 0.5), m * 0.8);
+    }
+    case 5u: {
+      // selection map: red = block matching used, blue = low confidence
+      let s = select(vec4f(0.0, 1.0, 0.0, 0.0), textureSampleLevel(selT, samp, p, 0.0), U.hybrid >= 0.0);
+      col = mix(vec3f(lum(A(p)) * 0.6), vec3f(1.0, 0.1, 0.1), s.r);
+      col = mix(col, vec3f(0.1, 0.3, 1.0), (1.0 - s.g) * 0.7);
     }
     default: { col = interp(p, t); }
   }

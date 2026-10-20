@@ -9,6 +9,7 @@
     target: 'display', // output rate: display | x2 | x2.5 | x3 (times the source fps) | fixed
     targetFps: 120, // used when target === 'fixed'
     hybrid: true, // also run block matching and use it where it explains the frames better than RIFE
+    anime: true, // skip repeated frames (anime drawn on twos / threes) and interpolate between drawings
     masking: 0, // 0..100: show the nearer original frame where no motion is trusted
     sceneSensitivity: 60, // 0..100: higher = scene changes detected more readily
     audioSync: false, // delay audio by the interpolation latency (routes the video's audio through WebAudio)

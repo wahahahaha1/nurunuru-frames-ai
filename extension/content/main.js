@@ -233,7 +233,7 @@
           if (this.engine.configure(v.videoWidth, v.videoHeight)) this.clock.frames = [];
           const last = this.clock.frames[this.clock.frames.length - 1];
           const prev = last && last.f && this.engine.isLive(last.f) ? last.f : null;
-          f = this.engine.ingest(v, prev);
+          f = this.engine.ingest(v, prev, this.settings.anime !== false);
         } catch (e) {
           if (e.name === 'SecurityError') this.fail('クロスオリジンの動画のため読み取れません');
           else this.noteError(e.message);

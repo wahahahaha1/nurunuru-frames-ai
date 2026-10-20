@@ -5,7 +5,7 @@
 // the display frames queued behind it.
 (() => {
   const S = (globalThis.NNF = globalThis.NNF || {});
-  const RING = 6;
+  const RING = 8; // enough for pairs of drawings on threes plus the frames queued behind them
   const BU = GPUBufferUsage;
   const TU = GPUTextureUsage;
   const CHUNK_SHARE = 0.45; // share of a display frame one inference chunk should take
@@ -217,6 +217,7 @@
               { binding: 5, resource: b.bm.fieldFView },
               { binding: 6, resource: b.bm.fieldGView },
               { binding: 7, resource: b.selView },
+              { binding: 8, resource: b.maskView },
             ],
           }),
           wg: [Math.ceil(r.mw / 16), Math.ceil(r.mh / 16), 1],
@@ -260,17 +261,14 @@
 
     // Upload a video frame (HTMLVideoElement or VideoFrame) into the next ring slot and convert it
     // to the model's input tensor. If `prev` (a frame returned earlier) is given, an inference job
-    // for (prev -> this frame) is queued. Returns the frame record.
-    ingest(source, prev) {
+    // for (prev -> this frame) is queued. With detectDup, the frame is also compared with prev:
+    // f.dupState becomes 'dup' (a repeat of the previous drawing, f.sameAs = the frame first showing
+    // it) or 'distinct' a moment later; jobs wait for it and pair distinct drawings only.
+    // Returns the frame record.
+    ingest(source, prev, detectDup = false) {
       const d = this.device;
       const r = this.res;
       const f = r.frames[r.next];
-      r.next = (r.next + 1) % RING;
-      f.id = ++this.seq;
-      f.hasPair = false;
-      f.hasSel = false;
-      f.pairPrevId = -1;
-      f.feat = false;
       const ext = d.importExternalTexture({ source });
       const enc = d.createCommandEncoder();
       const bg = d.createBindGroup({
@@ -288,15 +286,52 @@
       rp.setBindGroup(0, bg);
       rp.draw(3);
       rp.end();
+      return this.process(enc, prev, detectDup);
+    }
+
+    // Everything after the next ring slot's frame texture is written by `enc`: tensor, luma pyramid,
+    // duplicate test, inference job. (Tests write the texture themselves and call this.)
+    process(enc, prev, detectDup = false) {
+      const d = this.device;
+      const r = this.res;
+      const f = r.frames[r.next];
+      r.next = (r.next + 1) % RING;
+      f.id = ++this.seq;
+      f.hasPair = false;
+      f.hasSel = false;
+      f.pairPrevId = -1;
+      f.feat = false;
+      f.sameAs = null;
+      f.drawId = f.id; // id of the frame that first showed this drawing
+      f.pairDrawId = -1;
+      const live = !!prev && prev.id > 0 && this.isLive(prev);
+      const test = detectDup && live;
+      f.dupState = test ? 'unknown' : 'distinct';
+      if (test) this.bm.clearDiff(enc, f);
       const cp = enc.beginComputePass();
       cp.setPipeline(this.tensorPipe);
       cp.setBindGroup(0, f.tensorBG);
       cp.dispatchWorkgroups(Math.ceil(r.pw / 16), Math.ceil(r.ph / 16));
       this.bm.encodeLuma(cp, f);
+      if (test) this.bm.encodeDiff(cp, prev, f);
       cp.end();
       enc.clearBuffer(f.stats);
       d.queue.submit([enc.finish()]);
-      if (prev && prev.id > 0 && this.isLive(prev)) this.queueJob(prev, f);
+      if (test) {
+        const id = f.id;
+        this.bm.readDup(f).then(
+          (dup) => {
+            if (f.id !== id) return;
+            f.dupState = dup ? 'dup' : 'distinct';
+            if (dup) {
+              f.sameAs = prev.dupState === 'dup' && prev.sameAs ? prev.sameAs : prev;
+              f.drawId = prev.drawId;
+            }
+          },
+          () => {}
+        );
+      }
+      if (live) this.queueJob(prev, f);
       return f;
     }
 
@@ -341,7 +376,24 @@
       while (this.jobs.length > 2) this.jobs.splice(this.jobs[0].next > 0 ? 1 : 0, 1);
       if (!this.jobs.length || !this.res || this.inflight >= MAX_INFLIGHT) return;
       const job = this.jobs[0];
-      if (!job.steps) this.startJob(job);
+      if (!job.steps) {
+        // repeated drawings: wait for the duplicate test, drop pairs ending on a repeat and start
+        // pairs from the frame that first showed a repeated drawing
+        if (job.a.dupState === 'unknown' || job.b.dupState === 'unknown') return;
+        if (job.b.dupState === 'dup') {
+          this.jobs.shift();
+          return this.pump(vsyncMs, srcMs);
+        }
+        if (job.a.dupState === 'dup') {
+          // the frame that first showed the drawing, or (gone from the ring) this repeat of it
+          const s = job.a.sameAs;
+          if (s && this.isLive(s) && s.drawId === job.a.drawId) {
+            job.a = s;
+            job.aId = s.id;
+          }
+        }
+        this.startJob(job);
+      }
       const steps = job.steps;
       let jobMs = 0;
       for (const st of steps) jobMs += this.stepEst(st);
@@ -399,6 +451,7 @@
         job.b.hasPair = true;
         job.b.hasSel = job.useBM;
         job.b.pairPrevId = job.aId;
+        job.b.pairDrawId = job.a.drawId;
         this.jobs.shift();
       }
       d.queue.submit([enc.finish()]);
@@ -452,14 +505,14 @@
       return pipe;
     }
 
-    // Is the RIFE result for (a -> b) ready?
+    // Is the RIFE result for (a -> b) ready? (a may be any frame showing the same drawing)
     paired(a, b) {
-      return !!b && b !== a && this.isLive(b) && b.hasPair && b.pairPrevId === a.id;
+      return !!b && b !== a && this.isLive(b) && b.hasPair && (b.pairPrevId === a.id || (a.drawId != null && b.pairDrawId === a.drawId));
     }
 
     // Draw frame a..b at phase t into `view` (format `format`). rect = content rectangle
     // [x, y, w, h] in target pixels. opts: { mode, split, masking }.
-    // mode: 0 interpolate, 1 frame A, 2 frame B, 3 plain blend, 4 flow.
+    // mode: 0 interpolate, 1 frame A, 2 frame B, 3 plain blend, 4 flow, 5 selection map.
     render(view, format, rect, a, b, t, opts = {}) {
       const d = this.device;
       const p = this.params;
@@ -467,7 +520,7 @@
       const paired = this.paired(a, b);
       let mode = opts.mode || 0;
       // no inference result (yet): show the nearer frame rather than a ghosting blend
-      if (!paired && (mode === 0 || mode === 4)) mode = b === a || t < 0.5 ? 1 : 2;
+      if (!paired && (mode === 0 || mode >= 4)) mode = b === a || t < 0.5 ? 1 : 2;
       const sel = paired && b.hasSel;
       const buf = new ArrayBuffer(64);
       const f = new Float32Array(buf);
