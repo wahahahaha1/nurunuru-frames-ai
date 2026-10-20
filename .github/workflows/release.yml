@@ -1,0 +1,28 @@
+# Push a tag like v0.1.0 to build nurunuru-frames-ai-<version>.zip from extension/ and publish a release.
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check manifest version
+        run: |
+          v="$(jq -r .version extension/manifest.json)"
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "manifest version $v does not match tag $GITHUB_REF_NAME"; exit 1; }
+      - name: Build zip
+        run: |
+          name="nurunuru-frames-ai-${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          cp -r extension "dist/nurunuru-frames-ai"
+          (cd dist && zip -qr "$name.zip" nurunuru-frames-ai)
+          echo "ZIP=dist/$name.zip" >> "$GITHUB_ENV"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ZIP" --title "$GITHUB_REF_NAME" --notes-file .github/release-notes.md $(case "$GITHUB_REF_NAME" in *-*|v0.*) echo --prerelease;; esac)

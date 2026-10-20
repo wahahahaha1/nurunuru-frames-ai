@@ -28,12 +28,16 @@ YouTube とニコニコ動画を **ブラウザの中で AI（RIFE）を使っ�
 - WebGPU が使える **単体 GPU**。アドレスバーに `vivaldi://gpu`（Chrome は `chrome://gpu`）と入力し、**WebGPU: Hardware accelerated** と出ていれば使えます。通常版より重いので、内蔵 GPU では「速度優先」でも足りない可能性が高いです
 - 表示 Hz の高いモニター（120Hz 以上）だと効果が大きくなります
 
+## ダウンロード
+
+[Releases](../../releases) から `nurunuru-frames-ai-<バージョン>.zip` をダウンロードしてください。
+
 ## インストール
 
-1. このリポジトリの `extension` フォルダを好きな場所に置きます（使っている間は消さずに残してください）
+1. ダウンロードした zip を好きな場所に展開します（または、このリポジトリの `extension` フォルダを使います）。展開してできた `nurunuru-frames-ai` フォルダは、使っている間は消さずに残しておいてください
 2. アドレスバーに `vivaldi://extensions`（Chrome は `chrome://extensions`、Edge は `edge://extensions`）と入力して開きます
 3. 右上の **デベロッパーモード** をオンにします
-4. **「パッケージ化されていない拡張機能を読み込む」** を押し、`extension` フォルダ（`manifest.json` があるフォルダ）を選びます
+4. **「パッケージ化されていない拡張機能を読み込む」** を押し、`manifest.json` があるフォルダを選びます
 5. ツールバーに出る「NuruNuru Frames AI」アイコン（紫の再生マーク）から設定を開けます
 
 ## 使い方
