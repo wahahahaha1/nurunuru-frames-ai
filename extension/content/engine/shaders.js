@@ -601,7 +601,7 @@ ${bmInterp}
     }
   }
   let spread = max(max(hi.x - lo.x, hi.y - lo.y), max(hi.z - lo.z, hi.w - lo.w));
-  let wBM = smoothstep(0.0005, 0.004, eA - eB) * (1.0 - smoothstep(0.03, 0.08, eB)) * (1.0 - smoothstep(0.5, 0.8, occ))
+  let wBM = smoothstep(-0.001, 0.002, eA - eB) * (1.0 - smoothstep(0.03, 0.08, eB)) * (1.0 - smoothstep(0.5, 0.8, occ))
     * (1.0 - smoothstep(1.0, 2.5, spread));
   let conf = 1.0 - smoothstep(0.05, 0.15, min(eA, eB));
   textureStore(selOut, g.xy, vec4f(wBM, conf, wH, 1.0));
@@ -649,6 +649,32 @@ struct RU {
 
 fn A(p: vec2f) -> vec3f { return textureSampleLevel(texA, samp, p, 0.0).rgb; }
 fn B(p: vec2f) -> vec3f { return textureSampleLevel(texB, samp, p, 0.0).rgb; }
+// Catmull-Rom (bicubic) sample from 9 bilinear taps: keeps warped frames as sharp as the originals
+// (bilinear warping softens them, which shows as a pulsing sharpness at high frame rates).
+fn sharp(tex: texture_2d<f32>, uv: vec2f) -> vec3f {
+  let size = vec2f(textureDimensions(tex));
+  let sp = uv * size;
+  let tc = floor(sp - 0.5) + 0.5;
+  let f = sp - tc;
+  let w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+  let w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  let w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+  let w3 = f * f * (-0.5 + 0.5 * f);
+  let w12 = w1 + w2;
+  let t0 = (tc - 1.0) / size;
+  let t3 = (tc + 2.0) / size;
+  let t12 = (tc + w2 / w12) / size;
+  var r = textureSampleLevel(tex, samp, vec2f(t0.x, t0.y), 0.0).rgb * (w0.x * w0.y);
+  r += textureSampleLevel(tex, samp, vec2f(t12.x, t0.y), 0.0).rgb * (w12.x * w0.y);
+  r += textureSampleLevel(tex, samp, vec2f(t3.x, t0.y), 0.0).rgb * (w3.x * w0.y);
+  r += textureSampleLevel(tex, samp, vec2f(t0.x, t12.y), 0.0).rgb * (w0.x * w12.y);
+  r += textureSampleLevel(tex, samp, vec2f(t12.x, t12.y), 0.0).rgb * (w12.x * w12.y);
+  r += textureSampleLevel(tex, samp, vec2f(t3.x, t12.y), 0.0).rgb * (w3.x * w12.y);
+  r += textureSampleLevel(tex, samp, vec2f(t0.x, t3.y), 0.0).rgb * (w0.x * w3.y);
+  r += textureSampleLevel(tex, samp, vec2f(t12.x, t3.y), 0.0).rgb * (w12.x * w3.y);
+  r += textureSampleLevel(tex, samp, vec2f(t3.x, t3.y), 0.0).rgb * (w3.x * w3.y);
+  return clamp(r, vec3f(0.0), vec3f(1.0));
+}
 fn Fl(p: vec2f) -> vec4f { return textureSampleLevel(flowT, samp, p, 0.0); }
 fn Mk(p: vec2f) -> vec4f { return textureSampleLevel(maskT, samp, p, 0.0); }
 fn lum(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
@@ -688,8 +714,8 @@ fn rifeAt(p: vec2f, t: f32, tau: f32, fT: texture_2d<f32>, mT: texture_2d<f32>) 
   }
   let f = textureSampleLevel(fT, samp, q, 0.0);
   let m = textureSampleLevel(mT, samp, q, 0.0).r;
-  let a = A(q + f.xy);
-  let b = B(q + f.zw);
+  let a = sharp(texA, q + f.xy);
+  let b = sharp(texB, q + f.zw);
   let wa = m * (1.0 - s);
   let wb = (1.0 - m) * s;
   return vec4f((wa * a + wb * b) / max(wa + wb, 1e-6), best);
