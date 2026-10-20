@@ -1,0 +1,65 @@
+{
+  "manifest_version": 3,
+  "name": "NuruNuru Frames AI",
+  "version": "0.1.0",
+  "description": "YouTube とニコニコ動画を WebGPU 上の AI（RIFE）でフレーム補間し、ディスプレイのリフレッシュレートで再生します。",
+  "minimum_chrome_version": "116",
+  "permissions": ["storage"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_title": "NuruNuru Frames AI",
+    "default_popup": "popup/popup.html",
+    "default_icon": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png" }
+  },
+  "icons": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "commands": {
+    "toggle-enabled": {
+      "suggested_key": { "default": "Alt+Shift+S" },
+      "description": "フレーム補間の ON / OFF"
+    },
+    "toggle-demo": {
+      "suggested_key": { "default": "Alt+Shift+D" },
+      "description": "デモ表示 (左: 元映像 / 右: 補間) の切り替え"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://m.youtube.com/*",
+        "https://www.youtube-nocookie.com/*",
+        "https://www.nicovideo.jp/*",
+        "https://live.nicovideo.jp/*",
+        "https://embed.nicovideo.jp/*"
+      ],
+      "js": [
+        "content/settings.js",
+        "content/engine/gpu.js",
+        "content/engine/shaders.js",
+        "content/engine/rife.js",
+        "content/engine/interpolator.js",
+        "content/sites.js",
+        "content/overlay.js",
+        "content/clock.js",
+        "content/audio-sync.js",
+        "content/osd.js",
+        "content/main.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["models/rife-v4.6.bin"],
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://m.youtube.com/*",
+        "https://www.youtube-nocookie.com/*",
+        "https://www.nicovideo.jp/*",
+        "https://live.nicovideo.jp/*",
+        "https://embed.nicovideo.jp/*"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<header>
+  <h1>NuruNuru Frames AI</h1>
+  <label class="switch big"><input type="checkbox" id="enabled"><span></span></label>
+</header>
+
+<section id="status" class="status">状態を取得中…</section>
+
+<section>
+  <div class="row"><span>YouTube</span><label class="switch"><input type="checkbox" data-site="youtube"><span></span></label></div>
+  <div class="row"><span>ニコニコ動画</span><label class="switch"><input type="checkbox" data-site="niconico"><span></span></label></div>
+</section>
+
+<section>
+  <div class="label">目標フレームレート</div>
+  <div class="target">
+    <select id="target">
+      <option value="display">ディスプレイに合わせる</option>
+      <option value="x2">ソースの 2 倍</option>
+      <option value="x2.5">ソースの 2.5 倍</option>
+      <option value="x3">ソースの 3 倍</option>
+      <option value="fixed">固定値</option>
+    </select>
+    <input type="number" id="targetFps" min="24" max="500" step="1"><span class="unit">fps</span>
+  </div>
+  <div class="hint" id="targetHint"></div>
+</section>
+
+<section>
+  <div class="label">画質プリセット</div>
+  <div class="seg" id="preset">
+    <button data-v="fast">速度優先</button><button data-v="standard">標準</button><button data-v="quality">高画質</button>
+  </div>
+  <div class="hint">AI の推論解像度：速度優先 幅 512／標準 768／高画質 1024</div>
+  <div class="label">アーティファクトマスキング <output id="maskingOut"></output></div>
+  <input type="range" id="masking" min="0" max="100" step="5">
+  <div class="label">シーンチェンジ検出感度 <output id="sceneSensitivityOut"></output></div>
+  <input type="range" id="sceneSensitivity" min="0" max="100" step="5">
+</section>
+
+<section>
+  <div class="row"><span>音ズレ補正（音声を遅延・実験的）</span><label class="switch"><input type="checkbox" id="audioSync"><span></span></label></div>
+  <div class="label">音声オフセット <output id="audioOffsetMsOut"></output></div>
+  <input type="range" id="audioOffsetMs" min="-100" max="100" step="5">
+</section>
+
+<section>
+  <div class="row"><span>デモ表示（左: 元 / 右: 補間）</span><label class="switch"><input type="checkbox" id="demo"><span></span></label></div>
+  <div class="row"><span>フロー表示</span><label class="switch"><input type="checkbox" id="showVectors"><span></span></label></div>
+  <div class="row"><span>統計 OSD</span><label class="switch"><input type="checkbox" id="osd"><span></span></label></div>
+</section>
+
+<footer>Alt+Shift+S: ON/OFF　Alt+Shift+D: デモ表示</footer>
+<script src="../content/settings.js"></script>
+<script src="popup.js"></script>
+</body>
+</html>
