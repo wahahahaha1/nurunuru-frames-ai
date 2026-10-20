@@ -525,6 +525,8 @@ fn Bg(p: vec2f) -> vec3f { return B(p) * gB; }
 fn Fb(p: vec2f) -> vec4f { return textureSampleLevel(fieldF, samp, p * U.fieldScale, 0.0); }
 fn Gb(p: vec2f) -> vec4f { return textureSampleLevel(fieldG, samp, p * U.fieldScale, 0.0); }
 
+var<private> bmErr2: f32 = 0.0; // set by bmInterp: error of the worse direction (both must match)
+
 fn bmInterp(p: vec2f, t: f32) -> vec4f {
   var v = Fb(p).xy;
   for (var i = 0; i < 3; i++) { v = Fb(p - t * v).xy; }
@@ -547,6 +549,7 @@ fn bmInterp(p: vec2f, t: f32) -> vec4f {
   var side: vec3f;
   if (t < 0.5) { side = select(a1, a0, fq.z <= gq.z); } else { side = select(b1, b0, fq.z <= gq.z); }
   col = mix(col, side, bad);
+  bmErr2 = max(pF, pG);
   return vec4f(col, min(pF, pG));
 }
 `;
@@ -612,26 +615,37 @@ ${bmInterp}
   var eAraw = 0.0;
   var eH = 0.0;
   var eB = 0.0;
+  var eB2 = 0.0; // block matching, both directions
   var occ = 0.0;
+  var sq = vec3f(0.0); // squared errors (RIFE masked, RIFE raw, block matching): local breakdowns
   for (var dy = -2; dy <= 2; dy++) {
     for (var dx = -2; dx <= 2; dx++) {
       let p = p0 + vec2f(f32(dx), f32(dy)) * 2.0 / U.size;
       let ra = rifeErr(p, flowT, maskT);
+      let eb = bmInterp(p, 0.5).w;
+      let eb2 = bmErr2;
       eA += ra.x;
       eAraw += ra.z;
       occ = max(occ, ra.y);
       if (U.useHalf > 0.0) { eH += rifeErr(p, flowH, maskH).x; }
-      eB += bmInterp(p, 0.5).w;
+      eB += eb;
+      eB2 += eb2;
+      sq += vec3f(ra.x * ra.x, ra.z * ra.z, eb2 * eb2);
     }
   }
   eA /= 25.0;
   eAraw /= 25.0;
   eH /= 25.0;
   eB /= 25.0;
-  // a true occlusion defeats block matching too; where block matching explains both frames, RIFE's
-  // one-sided mask is not an excuse and its full disagreement counts
-  let bmGood = 1.0 - smoothstep(0.004, 0.015, eB);
+  eB2 /= 25.0;
+  // a true occlusion defeats block matching in one direction; where block matching explains both
+  // frames in both directions, RIFE's one-sided mask is not an excuse and its full disagreement counts
+  let bmGood = 1.0 - smoothstep(0.004, 0.015, eB2);
   eA = mix(eA, eAraw, bmGood);
+  // RIFE breaking down locally (RMS error well above block matching's, e.g. ghosted text)
+  let rmsA = sqrt(mix(sq.x, sq.y, bmGood) / 25.0);
+  let rmsB = sqrt(sq.z / 25.0);
+  let rifeFail = smoothstep(1.5, 2.5, (rmsA + 0.002) / (rmsB + 0.002)) * smoothstep(0.015, 0.03, rmsA);
   // half-resolution RIFE where it explains the frames clearly better (large motion)
   let wH = smoothstep(0.002, 0.01, eA - eH) * U.useHalf;
   eA = mix(eA, eH, wH);
@@ -655,13 +669,14 @@ ${bmInterp}
   }
   tex = smoothstep(0.01, 0.04, tex / 25.0); // 0 = flat, errors say little
   let rifeOk = 1.0 - smoothstep(0.01, 0.03, eA);
-  let spread = max(max(hi.x - lo.x, hi.y - lo.y) * rifeOk, max(hi.z - lo.z, hi.w - lo.w));
+  // (where RIFE breaks down, block matching's wandering vectors are the lesser evil)
+  let spread = max(max(hi.x - lo.x, hi.y - lo.y) * rifeOk, max(hi.z - lo.z, hi.w - lo.w) * (1.0 - rifeFail));
   // (a one-sided RIFE mask hints at occlusion, but RIFE also leans on one frame where both match:
   // block matching that explains the frames almost perfectly is still taken there)
   // ties go to block matching only where the picture has structure; in flat areas it must win clearly
   let tie = mix(0.002, -0.001, tex);
   let wBM = smoothstep(tie, tie + 0.003, eA - eB) * (1.0 - smoothstep(0.03, 0.08, eB))
-    * (1.0 - smoothstep(0.5, 0.8, occ) * smoothstep(0.004, 0.015, eB))
+    * (1.0 - smoothstep(0.5, 0.8, occ) * smoothstep(0.004, 0.015, eB2))
     * (1.0 - smoothstep(1.0, 2.5, spread));
   let conf = 1.0 - smoothstep(0.05, 0.15, min(eA, eB));
   textureStore(selOut, g.xy, vec4f(wBM, conf, wH, 1.0));
