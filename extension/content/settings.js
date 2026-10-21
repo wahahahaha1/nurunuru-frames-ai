@@ -12,7 +12,7 @@
     anime: true, // skip repeated frames (anime drawn on twos / threes) and interpolate between drawings
     anchors: false, // also infer RIFE at t = 0.25 / 0.75 (3x inference), used where t = 0.5 extrapolates badly
     multiscale: true, // also infer RIFE at half resolution (large motion), used where the selection map prefers it (with hybrid)
-    ensemble: false, // also infer RIFE on the swapped pair and average (2x inference, more accurate motion); being evaluated
+    ensemble: true, // also infer RIFE on the swapped pair and average (2x inference, more accurate motion)
     masking: 0, // 0..100: show the nearer original frame where no motion is trusted
     sceneSensitivity: 60, // 0..100: higher = scene changes detected more readily
     audioSync: false, // delay audio by the interpolation latency (routes the video's audio through WebAudio)
