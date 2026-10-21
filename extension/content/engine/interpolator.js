@@ -31,7 +31,9 @@
         fragment: { module: ingestMod, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
       });
       this.tensorPipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.toTensor, 'to-tensor'), entryPoint: 'main' } });
+      // selection map: models fitted for the ensemble / for RIFE alone
       this.selectPipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.select, 'select'), entryPoint: 'main' } });
+      this.selectPipePlain = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.selectPlain, 'select-plain'), entryPoint: 'main' } });
       this.combinePipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.combine, 'combine'), entryPoint: 'main' } });
       this.bm = new S.BlockMatcher(device, this.samp);
       this.renderMod = mod(W.render, 'render');
@@ -299,13 +301,14 @@
       }
       if (useHalf) steps.push(...this.netH.job(a.tensorH, b.tensorH, { flowView: b.flowHView, maskView: b.maskHView, stats: this.res.scratchStats }));
       if (useBM) {
+        const pipe = useEns ? this.selectPipe : this.selectPipePlain;
         steps.push({
           key: 'sel',
-          pipe: this.selectPipe,
+          pipe,
           block: -2,
           kind: 'bm',
           bg: this.device.createBindGroup({
-            layout: this.selectPipe.getBindGroupLayout(0),
+            layout: pipe.getBindGroupLayout(0),
             entries: [
               { binding: 0, resource: { buffer: useHalf ? r.selectUH : r.selectU } },
               { binding: 1, resource: this.samp },

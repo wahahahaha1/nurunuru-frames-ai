@@ -558,7 +558,31 @@ fn bmInterp(p: vec2f, t: f32) -> vec4f {
   // (5x5 samples), how well each explains the two frames at t = 0.5 (photometric error of its two
   // warps) along with local motion and structure cues, and turns them into r = weight of block
   // matching (a fitted logistic model), g = confidence (low where both disagree).
-  const select = /* wgsl */ `
+  // Coefficients of the selection map's logistic models (features as in the select shader below),
+  // fitted on the test scenes by tools outside the extension: for RIFE alone (plain) and for the
+  // ensemble (RIFE on both input orders, which is more accurate, so the evidence is weighed differently).
+  // bm: block matching weight without half-resolution RIFE; half / halfBM: weights with it.
+  // BEGIN SELECT_MODELS
+  S.SELECT_MODELS = {
+    plain: {
+      bm: { b: -4.0731, lg: [-0.5478, 1.2922, -0.2285, -0.8051], occ: 0.1986, lr: [0.4085, -0.5651], x1: [1.1605, 0.0970, -0.1539, -0.5495], x2: [0.0793, -0.0751, -0.2692, 0.4142] },
+      half: { b: -9.3859, lg: [0.1923, 0.6223, -0.3543, -0.0417], occ: 0.9278, lr: [-0.2137, 0.0267], x1: [0.4801, -0.0193, 0.2251, 0.5436], x2: [-0.5134, 0.9157, -0.4607, 0.1104], x3: [-0.0876, -0.2400, -0.2081, 1.0981] },
+      halfBM: { b: -4.7175, lg: [-0.3728, 1.1731, -0.2157, -0.6690], occ: -0.1180, lr: [0.3567, -0.5548], x1: [1.3183, 0.2830, -0.1427, -0.3351], x2: [0.1049, 0.4514, -0.3687, 0.5567], x3: [-0.1147, -0.0108, 0.0461, -0.2863] },
+    },
+    ensemble: {
+      bm: { b: -4.0402, lg: [-0.5151, 1.3375, -0.2131, -0.7963], occ: 0.2741, lr: [0.3439, -0.5424], x1: [1.2594, 0.1042, -0.0997, -0.5127], x2: [0.0144, -0.3424, -0.3487, 0.3499] },
+      half: { b: -6.5662, lg: [0.1317, 1.2067, -0.1150, -0.1714], occ: 0.2638, lr: [-0.2111, 0.0129], x1: [0.5436, -0.2880, 0.1574, -0.0110], x2: [-0.2349, 1.2257, -0.2529, 0.5743], x3: [0.1521, -0.6462, -0.4182, 1.1957] },
+      halfBM: { b: -3.3584, lg: [-0.3847, 1.1339, -0.0460, -0.5938], occ: 0.4058, lr: [0.1390, -0.4683], x1: [1.4989, 0.1417, -0.1204, -0.6738], x2: [-0.1476, -1.6568, -0.4094, 0.0131], x3: [-0.2887, -0.1079, 0.1160, -0.1649] },
+    },
+  };
+  // END SELECT_MODELS
+
+  // Logistic model as WGSL: z = b + w . features (x3: half-resolution features, if used).
+  const v = (a) => `vec${a.length}f(${a.map((x) => x.toFixed(4)).join(', ')})`;
+  const logit = (c, x3) =>
+    `${c.b.toFixed(4)} + dot(lg, ${v(c.lg)}) + ${c.occ.toFixed(4)} * occ + dot(lr, ${v(c.lr)}) + dot(x1, ${v(c.x1)}) + dot(x2, ${v(c.x2)})` +
+    (x3 ? ` + dot(x3, ${v(c.x3)})` : '');
+  const selectFor = (m) => /* wgsl */ `
 struct SU { fieldScale: vec2f, size: vec2f, useHalf: f32, pad0: f32, pad1: f32, pad2: f32 };
 @group(0) @binding(0) var<uniform> U: SU;
 @group(0) @binding(1) var samp: sampler;
@@ -691,21 +715,17 @@ ${bmInterp}
   if (U.useHalf > 0.0) {
     let fh0 = textureSampleLevel(flowH, samp, p0, 0.0);
     let x3 = vec4f(log(eH + 1e-3), log(eHraw + 1e-3), log(sqrt(sqH / 25.0) + 1e-3), log(1.0 + min(length((fh0.zw - fh0.xy) * U.size) * px, 64.0)));
-    let zH = -9.3859 + dot(lg, vec4f(0.1923, 0.6223, -0.3543, -0.0417)) + 0.9278 * occ + dot(lr, vec2f(-0.2137, 0.0267))
-      + dot(x1, vec4f(0.4801, -0.0193, 0.2251, 0.5436)) + dot(x2, vec4f(-0.5134, 0.9157, -0.4607, 0.1104)) + dot(x3, vec4f(-0.0876, -0.2400, -0.2081, 1.0981));
-    let zB = -4.7175 + dot(lg, vec4f(-0.3728, 1.1731, -0.2157, -0.6690)) - 0.1180 * occ + dot(lr, vec2f(0.3567, -0.5548))
-      + dot(x1, vec4f(1.3183, 0.2830, -0.1427, -0.3351)) + dot(x2, vec4f(0.1049, 0.4514, -0.3687, 0.5567)) + dot(x3, vec4f(-0.1147, -0.0108, 0.0461, -0.2863));
-    wH = 1.0 / (1.0 + exp(-zH));
-    wBM = 1.0 / (1.0 + exp(-zB));
+    wH = 1.0 / (1.0 + exp(-(${logit(m.half, true)})));
+    wBM = 1.0 / (1.0 + exp(-(${logit(m.halfBM, true)})));
   } else {
-    let z = -4.0731 + dot(lg, vec4f(-0.5478, 1.2922, -0.2285, -0.8051)) + 0.1986 * occ + dot(lr, vec2f(0.4085, -0.5651))
-      + dot(x1, vec4f(1.1605, 0.0970, -0.1539, -0.5495)) + dot(x2, vec4f(0.0793, -0.0751, -0.2692, 0.4142));
-    wBM = 1.0 / (1.0 + exp(-z));
+    wBM = 1.0 / (1.0 + exp(-(${logit(m.bm, false)})));
   }
   let conf = 1.0 - smoothstep(0.05, 0.15, min(eA, eB));
   textureStore(selOut, g.xy, vec4f(wBM, conf, wH, 1.0));
 }
 `;
+  const select = selectFor(S.SELECT_MODELS.ensemble);
+  const selectPlain = selectFor(S.SELECT_MODELS.plain);
 
   // Interpolated frame at phase t, rendered straight into the output (canvas or test texture).
   // A point at q on the mid-time grid sits at q + f0 in A, q + f1 in B and, assuming piecewise
@@ -920,5 +940,5 @@ fn interp(p: vec2f, t: f32) -> vec3f {
 }
 `;
 
-  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, pack, select, render, combine };
+  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, pack, select, selectPlain, render, combine };
 })();
