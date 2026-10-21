@@ -48,6 +48,28 @@
     return S._devicePromise;
   };
 
+  // Auto-tuner results (conv tilings per GPU / model / size), in the extension's local storage.
+  const hasLocal = () => typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local;
+  S.loadTune = async (key) => {
+    if (!hasLocal()) return null;
+    try {
+      const v = (await chrome.storage.local.get('tune')).tune || {};
+      return v[key] || null;
+    } catch (e) {
+      return null;
+    }
+  };
+  S.saveTune = async (key, choice) => {
+    if (!hasLocal()) return;
+    try {
+      const v = (await chrome.storage.local.get('tune')).tune || {};
+      v[key] = choice;
+      await chrome.storage.local.set({ tune: v });
+    } catch (e) {
+      // ignore
+    }
+  };
+
   // RIFE network of a model for a device (weights are fetched once and kept for device re-creation).
   S.getRifeNet = function getRifeNet(device, model) {
     S._weights = S._weights || new Map();

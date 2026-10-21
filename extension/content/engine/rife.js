@@ -22,6 +22,16 @@
     conv1s: { stride: 1, tx: 8, ty: 8, px: 1, py: 1, ci: 8 }, // small feature maps (coarse blocks)
     conv2: { stride: 2, tx: 16, ty: 8, px: 2, py: 1, ci: 2, co: 32 }, // fastest of the benchmark's sweep on an RTX 3080
   };
+  // Alternative tilings per kind, tried by the auto-tuner (index 0 = the default above). Which is
+  // fastest depends on the GPU and the layer's shape.
+  const CONV_VARIANTS = {
+    conv1: [CONV_CFG.conv1, { stride: 1, tx: 16, ty: 8, px: 2, py: 2, ci: 4, co: 32 }, { stride: 1, tx: 16, ty: 16, px: 2, py: 1, ci: 4 }],
+    conv1s: [CONV_CFG.conv1s, { stride: 1, tx: 8, ty: 8, px: 1, py: 1, ci: 4, co: 32 }, CONV_CFG.conv1],
+    conv2: [CONV_CFG.conv2, { stride: 2, tx: 8, ty: 8, px: 2, py: 2, ci: 2 }, { stride: 2, tx: 8, ty: 8, px: 2, py: 2, ci: 2, co: 32 }],
+  };
+  // shared memory of a tiling (input tile + weights)
+  const smemBytes = (c) =>
+    4 * (c.ci * ((c.tx * c.px - 1) * c.stride + 3) * ((c.ty * c.py - 1) * c.stride + 3) + ((c.co || 16) / 16) * c.ci * 36 * 4);
   // Workgroups a dispatch should offer to fill a large GPU; small layers get split-K below this.
   const TARGET_WG = 512;
 
@@ -200,8 +210,82 @@
       this.layers = blocks;
       this.wbuf = d.createBuffer({ size: data.byteLength, usage: BU.STORAGE | BU.COPY_DST });
       d.queue.writeBuffer(this.wbuf, 0, data);
+      this.convPipes = new Map(); // tiling -> pipeline (shared with siblings)
+      this.choice = new Map(); // 'layer key@size' -> index into CONV_VARIANTS (auto-tuner; shared with siblings)
       this.res = null;
       this.keyPrefix = '';
+    }
+
+    pipeFor(cfg) {
+      const k = JSON.stringify(cfg);
+      let p = this.convPipes.get(k);
+      if (!p) {
+        p = this.device.createComputePipeline({ layout: 'auto', compute: { module: this.device.createShaderModule({ code: S.WGSL.conv(cfg) }), entryPoint: 'main' } });
+        this.convPipes.set(k, p);
+      }
+      return p;
+    }
+
+    // Time the tilings of every conv layer of the blocks at size cw x ch (own scratch buffers, so
+    // that inference in flight is not disturbed) and remember for each layer the fastest, where it is
+    // at least 5 % faster than the default. Needs timestamp queries. Returns the number of layers
+    // that use a non-default tiling.
+    async tune(cw, ch) {
+      const d = this.device;
+      if (!d.features.has('timestamp-query')) return 0;
+      const t = this.sibling('T');
+      t.configure(cw, ch);
+      const lim = d.limits.maxComputeWorkgroupStorageSize;
+      const tests = [];
+      for (const a of t.res.convCalls) {
+        const [key, , L, stride, , , , , ow, oh] = a;
+        const kind = convPlan(L, stride, ow, oh).key;
+        CONV_VARIANTS[kind].forEach((cfg, idx) => {
+          if (smemBytes(cfg) <= lim) tests.push({ lk: `${key}@${ow}x${oh}`, idx, steps: t.res.convSteps(...a.slice(0, 10), a[10], idx), ms: [] });
+        });
+      }
+      const REPEAT = 3;
+      for (let round = -1; round < 5; round++) {
+        // (round -1: warm-up, pipeline compilation)
+        const qs = d.createQuerySet({ type: 'timestamp', count: 2 * tests.length });
+        const enc = d.createCommandEncoder();
+        tests.forEach((x, i) => {
+          const cp = enc.beginComputePass({ timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 2 * i, endOfPassWriteIndex: 2 * i + 1 } });
+          for (let r = 0; r < REPEAT; r++) {
+            for (const s of x.steps) {
+              cp.setPipeline(s.pipe);
+              cp.setBindGroup(0, s.bg);
+              cp.dispatchWorkgroups(...s.wg);
+            }
+          }
+          cp.end();
+        });
+        const size = 16 * tests.length;
+        const resolve = d.createBuffer({ size, usage: BU.QUERY_RESOLVE | BU.COPY_SRC });
+        const read = d.createBuffer({ size, usage: BU.COPY_DST | BU.MAP_READ });
+        enc.resolveQuerySet(qs, 0, 2 * tests.length, resolve, 0);
+        enc.copyBufferToBuffer(resolve, 0, read, 0, size);
+        d.queue.submit([enc.finish()]);
+        await read.mapAsync(GPUMapMode.READ);
+        const ts = new BigInt64Array(read.getMappedRange());
+        if (round >= 0) tests.forEach((x, i) => x.ms.push(Number(ts[2 * i + 1] - ts[2 * i]) / 1e6 / REPEAT));
+        read.unmap();
+        [qs, resolve, read].forEach((o) => o.destroy());
+      }
+      t.destroyResources();
+      const med = (a) => [...a].sort((x, y) => x - y)[a.length >> 1];
+      const byLayer = new Map();
+      for (const x of tests) {
+        if (!byLayer.has(x.lk)) byLayer.set(x.lk, []);
+        byLayer.get(x.lk).push({ idx: x.idx, ms: med(x.ms) });
+      }
+      for (const [lk, rs] of byLayer) {
+        const def = rs.find((r) => r.idx === 0);
+        const best = rs.reduce((a, b) => (b.ms < a.ms ? b : a));
+        if (def && best.idx !== 0 && best.ms < 0.95 * def.ms) this.choice.set(lk, best.idx);
+        else this.choice.delete(lk);
+      }
+      return [...byLayer.keys()].filter((lk) => this.choice.has(lk)).length;
     }
 
     // A second network sharing weights and pipelines, with its own size and scratch buffers
@@ -264,8 +348,11 @@
       let maxPart = 0;
       let maxTmp = 0;
       const notePart = (L, stride, ow, oh) => {
-        const c = convPlan(L, stride, ow, oh);
-        if (c.ks > 1) maxPart = Math.max(maxPart, c.ks * L.cout * ow * oh);
+        // (any tiling the auto-tuner may pick)
+        for (const cfg of CONV_VARIANTS[convPlan(L, stride, ow, oh).key]) {
+          const c = convPlan(L, stride, ow, oh, { conv1: cfg, conv1s: cfg, conv2: cfg });
+          if (c.ks > 1) maxPart = Math.max(maxPart, c.ks * L.cout * ow * oh);
+        }
       };
       for (const p of plan) {
         maxIn = Math.max(maxIn, p.inC * p.bw * p.bh);
@@ -299,15 +386,19 @@
           entries: entries.map((r, i) => ({ binding: i, resource: r instanceof GPUBuffer ? { buffer: r } : r })),
         });
       // Conv layer -> 1 step, or 2 with split-K (partial sums, then reduce + bias + residual + act).
-      const convSteps = (key, block, L, stride, inBuf, iw, ih, outBuf, ow, oh, resBuf) => {
-        const c = convPlan(L, stride, ow, oh);
-        const pipe = this.pipes[c.key];
+      // (variant: index into CONV_VARIANTS; default: the auto-tuner's choice for this layer, else 0)
+      const convSteps = (key, block, L, stride, inBuf, iw, ih, outBuf, ow, oh, resBuf, variant) => {
+        const base = convPlan(L, stride, ow, oh);
+        const vi = variant != null ? variant : this.choice.get(`${key}@${ow}x${oh}`) || 0;
+        const cfg = CONV_VARIANTS[base.key][vi];
+        const c = vi === 0 ? base : { ...convPlan(L, stride, ow, oh, { conv1: cfg, conv1s: cfg, conv2: cfg }), key: base.key };
+        const pipe = vi === 0 ? this.pipes[c.key] : this.pipeFor(cfg);
         const split = c.ks > 1;
         const u = uni(new Uint32Array([L.cin, L.cout, iw, ih, ow, oh, L.wOff, L.bOff, resBuf ? 1 : 0, 1, c.ncog, c.cinPer, split ? 1 : 0, 0, 0, 0]));
         const kind = stride === 1 ? 'conv1' : 'conv2';
-        const variant = `${c.key} ${L.cin}→${L.cout} ${ow}×${oh}${split ? ` k${c.ks}` : ''}`; // (for profiling)
+        const desc = `${c.key}${vi ? `/${vi}` : ''} ${L.cin}→${L.cout} ${ow}×${oh}${split ? ` k${c.ks}` : ''}`; // (for profiling)
         const layer = { L, stride, iw, ih, ow, oh }; // (for the benchmark's kernel sweep)
-        const conv = { key: this.keyPrefix + key, pipe, block, kind, variant, layer, bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, split ? bufs.part : outBuf]), wg: c.wg, cost: L.cin * L.cout * 9 * ow * oh };
+        const conv = { key: this.keyPrefix + key, pipe, block, kind, variant: desc, layer, bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, split ? bufs.part : outBuf]), wg: c.wg, cost: L.cin * L.cout * 9 * ow * oh };
         if (!split) return [conv];
         const n = L.cout * ow * oh;
         const ru = uni(new Uint32Array([n, ow * oh, c.ks, resBuf ? 1 : 0, L.bOff, 1, 0, 0]));
@@ -315,16 +406,21 @@
         return [conv, { key: this.keyPrefix + key + 'r', pipe: red, block, kind, bg: bg(red, [ru, bufs.part, this.wbuf, resBuf || bufs.part, outBuf]), wg: [Math.ceil(n / 256), 1, 1], cost: n * c.ks }];
       };
       const steps = []; // static steps (block inputs are filled per job)
+      const convCalls = []; // arguments of the blocks' conv layers (for the auto-tuner)
+      const blockConv = (...a) => {
+        convCalls.push(a);
+        return convSteps(...a);
+      };
       for (const p of plan) {
         const { L, i: b } = p;
         p.prepIndex = steps.length;
         steps.push(null);
-        steps.push(...convSteps(`b${b}c0`, b, L.conv0[0], 2, bufs.x, p.bw, p.bh, bufs.mid, ...p.h1));
-        steps.push(...convSteps(`b${b}c1`, b, L.conv0[1], 2, bufs.mid, ...p.h1, bufs.f0, ...p.h2));
+        steps.push(...blockConv(`b${b}c0`, b, L.conv0[0], 2, bufs.x, p.bw, p.bh, bufs.mid, ...p.h1));
+        steps.push(...blockConv(`b${b}c1`, b, L.conv0[1], 2, bufs.mid, ...p.h1, bufs.f0, ...p.h2));
         let cur = bufs.f0;
         let other = bufs.f1;
         L.res.forEach((R, j) => {
-          steps.push(...convSteps(`b${b}r${j}`, b, R, 1, cur, ...p.h2, other, ...p.h2, cur));
+          steps.push(...blockConv(`b${b}r${j}`, b, R, 1, cur, ...p.h2, other, ...p.h2, cur));
           [cur, other] = [other, cur];
         });
         const [fw, fh] = p.h2;
@@ -369,7 +465,7 @@
         p.prepCost = p.bw * p.bh * (b === 0 ? 30 : 400);
       }
       this.res = {
-        cw, ch, pw, ph, plan, bufs, steps, uniforms, bg, convSteps, uni,
+        cw, ch, pw, ph, plan, bufs, steps, uniforms, bg, convSteps, convCalls, uni,
         packU: uni(new Uint32Array([cw, ch, pw, ph])),
         headCache: new Map(),
       };

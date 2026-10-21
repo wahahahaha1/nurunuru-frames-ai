@@ -216,6 +216,14 @@
         (device.features.has('timestamp-query') ? '' : '（タイムスタンプ非対応のため、待ち時間を含む概算です）');
       $('result').hidden = false;
       $('note').hidden = false;
+      {
+        // warm-up: let the GPU reach its clocks before anything is measured (else the first numbers
+        // are several times too high)
+        const net = await S.getRifeNet(device, S.PRESETS.standard.model);
+        const w = makeJob(device, net, { ...S.PRESETS.standard, hybrid: true, multiscale: true, ensemble: true });
+        for (const t0 = performance.now(); performance.now() - t0 < 2000; ) await timeGroups(device, [w.steps]);
+        w.eng.destroy();
+      }
       for (const preset of ['fast', 'standard', 'quality']) {
         const P = S.PRESETS[preset];
         const net = await S.getRifeNet(device, P.model);
@@ -274,6 +282,28 @@
         }
         j.eng.destroy();
         await new Promise((r) => setTimeout(r, 50));
+      }
+      // auto-tuning of the conv tilings (what the player does once per GPU / model / size)
+      if (device.features.has('timestamp-query')) {
+        const P = S.PRESETS.standard;
+        const net = await S.getRifeNet(device, P.model);
+        const opt = { ...P, hybrid: true, multiscale: true, ensemble: true };
+        const a = makeJob(device, net, opt);
+        const before = (await timeJob(device, a.steps)).ms;
+        const r = a.eng.res;
+        a.eng.destroy();
+        const n1 = await net.tune(r.mw, r.mh);
+        const n2 = await net.tune(r.half.cw, r.half.ch);
+        net.destroyResources();
+        const b = makeJob(device, net, opt);
+        const after = (await timeJob(device, b.steps)).ms;
+        b.eng.destroy();
+        $('tune').textContent = `組み方を変えた層：${n1 + n2}　処理 1 回（標準・既定の設定）：${before.toFixed(1)} ms → ${after.toFixed(1)} ms`;
+        $('tune').hidden = false;
+        $('tuneTitle').hidden = false;
+        log(`tune: ${n1}+${n2} layers changed, ${before.toFixed(2)} -> ${after.toFixed(2)} ms; ` + [...net.choice].map(([k, v]) => `${k}=${v}`).join(' '));
+        net.choice.clear();
+        net.destroyResources();
       }
       if (err) log('GPU エラー: ' + err);
       log(`${navigator.userAgent}`);

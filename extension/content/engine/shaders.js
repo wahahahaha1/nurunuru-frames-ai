@@ -624,7 +624,8 @@ fn bmInterp(p: vec2f, t: f32) -> vec4f {
   // matching (a fitted logistic model), g = confidence (low where both disagree).
   // Coefficients of the selection map's logistic models (features as in the select shader below),
   // fitted on the test scenes by tools outside the extension: for RIFE alone (plain) and for the
-  // ensemble (RIFE on both input orders, which is more accurate, so the evidence is weighed differently).
+  // ensemble (RIFE on both input orders, which is more accurate, so the evidence is weighed differently)
+  // and for the 4-way ensemble (also on the mirrored pair).
   // bm: block matching weight without half-resolution RIFE; half / halfBM: weights with it.
   // BEGIN SELECT_MODELS
   S.SELECT_MODELS = {
@@ -637,6 +638,11 @@ fn bmInterp(p: vec2f, t: f32) -> vec4f {
       bm: { b: -4.0402, lg: [-0.5151, 1.3375, -0.2131, -0.7963], occ: 0.2741, lr: [0.3439, -0.5424], x1: [1.2594, 0.1042, -0.0997, -0.5127], x2: [0.0144, -0.3424, -0.3487, 0.3499] },
       half: { b: -6.5662, lg: [0.1317, 1.2067, -0.1150, -0.1714], occ: 0.2638, lr: [-0.2111, 0.0129], x1: [0.5436, -0.2880, 0.1574, -0.0110], x2: [-0.2349, 1.2257, -0.2529, 0.5743], x3: [0.1521, -0.6462, -0.4182, 1.1957] },
       halfBM: { b: -3.3584, lg: [-0.3847, 1.1339, -0.0460, -0.5938], occ: 0.4058, lr: [0.1390, -0.4683], x1: [1.4989, 0.1417, -0.1204, -0.6738], x2: [-0.1476, -1.6568, -0.4094, 0.0131], x3: [-0.2887, -0.1079, 0.1160, -0.1649] },
+    },
+    ensemble4: {
+      bm: { b: -4.1809, lg: [-0.6668, 1.3835, -0.1828, -0.8147], occ: 0.3318, lr: [0.4635, -0.5351], x1: [1.3579, 0.0576, -0.0440, -0.5177], x2: [-0.0072, -0.5283, -0.4236, 0.3056] },
+      half: { b: -4.6490, lg: [0.1815, 1.4657, -0.1928, -0.0661], occ: 0.1279, lr: [-0.1609, -0.0518], x1: [0.4346, -0.5124, 0.1461, -0.1593], x2: [-0.3018, 1.7053, -0.1185, 0.4414], x3: [0.1951, -0.7796, -0.6036, 1.1663] },
+      halfBM: { b: -3.8800, lg: [-0.4203, 1.1316, -0.0458, -0.5755], occ: 0.4460, lr: [0.1319, -0.4222], x1: [2.1331, 0.0565, -0.1541, -0.5021], x2: [-0.0842, -2.1438, -0.4092, -0.0920], x3: [-0.2976, -0.0942, 0.0639, -0.3417] },
     },
   };
   // END SELECT_MODELS

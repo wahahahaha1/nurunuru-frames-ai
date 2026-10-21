@@ -55,6 +55,7 @@
       this.stepMs = new Map();
       this.jobCount = 0;
       this.inflight = 0; // submitted inference chunks the GPU has not finished yet
+      this.pendingRetune = false; // the auto-tuner changed tilings: rebuild the networks between jobs
       // pairs that needed inference (started, or skipped for being behind) / were completed, for the
       // player's load and starvation checks (repeated drawings need none)
       this.demand = 0;
@@ -260,7 +261,50 @@
         ens['mask' + k + 'View'] = ens['mask' + k].createView();
       }
       this.res = { srcW, srcH, fw, fh, mw, mh, pw, ph, half, ingestU, tensorU, tensorUM, tensorUH, selectU, selectUH, scratchStats, ens, frames, next: 0, jobKeys: new Map() };
+      if (this.params.autotune) this.scheduleTune();
       return true;
+    }
+
+    // Auto-tuning of the conv tilings for this GPU, model and size: from storage if done before,
+    // else measured a few seconds after playback starts (and stored). The networks are rebuilt
+    // with the result between two jobs (pump()).
+    scheduleTune() {
+      const r = this.res;
+      const net = this.net;
+      const info = this.device.adapterInfo || {};
+      const key = [info.vendor, info.architecture, info.device, info.description, net.model, `${r.mw}x${r.mh}`, `${r.half.cw}x${r.half.ch}`].join('|');
+      if (this.tuneKey === key) return;
+      this.tuneKey = key;
+      const current = () => this.tuneKey === key && this.res && this.net === net;
+      S.loadTune(key).then((stored) => {
+        if (!current()) return;
+        if (stored) {
+          for (const [k, v] of Object.entries(stored)) net.choice.set(k, v);
+          this.pendingRetune = true;
+          return;
+        }
+        setTimeout(async () => {
+          if (!current()) return;
+          try {
+            await net.tune(r.mw, r.mh);
+            await net.tune(r.half.cw, r.half.ch);
+            if (!current()) return;
+            S.saveTune(key, Object.fromEntries(net.choice));
+            this.pendingRetune = true;
+          } catch (e) {
+            // (device lost or the like: keep the default tilings)
+          }
+        }, 3000);
+      });
+    }
+
+    rebuildNets() {
+      for (const n of [this.net, this.netS, this.netH]) {
+        if (!n.res) continue;
+        const { cw, ch } = n.res;
+        n.destroyResources();
+        n.configure(cw, ch);
+      }
     }
 
     // Step keys of a typical job (one Head + the pair) with the current options, for jobMs().
@@ -604,6 +648,11 @@
       while (this.jobs.length > 2) {
         const [j] = this.jobs.splice(this.jobs[0].next > 0 ? 1 : 0, 1);
         if (j.b.dupState !== 'dup') this.demand++;
+      }
+      if (this.pendingRetune && !this.jobs.some((j) => j.steps)) {
+        // (no job holds steps of the old networks)
+        this.pendingRetune = false;
+        this.rebuildNets();
       }
       if (!this.jobs.length || !this.res || this.inflight >= MAX_INFLIGHT) return;
       const job = this.jobs[0];
