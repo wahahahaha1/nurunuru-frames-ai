@@ -13,6 +13,7 @@
     anchors: false, // also infer RIFE at t = 0.25 / 0.75 (3x inference), used where t = 0.5 extrapolates badly
     multiscale: true, // also infer RIFE at half resolution (large motion), used where the selection map prefers it (with hybrid)
     ensemble: true, // also infer RIFE on the swapped pair and average (2x inference, more accurate motion)
+    ensemble4: false, // with ensemble: also on the mirrored pair both ways (4x inference in all, for fast GPUs)
     masking: 0, // 0..100: show the nearer original frame where no motion is trusted
     sceneSensitivity: 60, // 0..100: higher = scene changes detected more readily
     audioSync: false, // delay audio by the interpolation latency (routes the video's audio through WebAudio)
@@ -57,7 +58,7 @@
     hybrid: s.hybrid !== false,
     anchors: !!s.anchors,
     multiscale: !!s.multiscale,
-    ensemble: !!s.ensemble,
+    ensemble: s.ensemble ? (s.ensemble4 ? 4 : true) : false,
     masking: s.masking / 100,
     sceneFrac: 0.6 - (0.5 * s.sceneSensitivity) / 100, // default 60 -> 0.3 (normal pairs stay below ~0.1, cuts mostly above 0.45)
   });

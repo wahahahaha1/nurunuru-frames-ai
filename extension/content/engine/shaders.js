@@ -726,6 +726,7 @@ ${bmInterp}
 }
 `;
   const select = selectFor(S.SELECT_MODELS.ensemble);
+  const selectEns4 = selectFor(S.SELECT_MODELS.ensemble4 || S.SELECT_MODELS.ensemble);
   const selectPlain = selectFor(S.SELECT_MODELS.plain);
 
   // Interpolated frame at phase t, rendered straight into the output (canvas or test texture).
@@ -969,5 +970,5 @@ fn interp(p: vec2f, t: f32) -> vec3f {
 }
 `;
 
-  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, pack, select, selectPlain, render, combine, combine4 };
+  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, pack, select, selectPlain, selectEns4, render, combine, combine4 };
 })();

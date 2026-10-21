@@ -96,7 +96,7 @@
 
     applySettings(s) {
       const o = this.settings;
-      const engineChanged = ['preset', 'hybrid', 'multiscale', 'anchors', 'ensemble'].some((k) => s[k] !== o[k]);
+      const engineChanged = ['preset', 'hybrid', 'multiscale', 'anchors', 'ensemble', 'ensemble4'].some((k) => s[k] !== o[k]);
       if (engineChanged || this.perf.stopped) {
         // the user changed something: forget automatic downgrades (and a stop) and try again
         if (this.perf.stopped) this.failed = null;
@@ -117,6 +117,7 @@
       const params = S.engineParams({ ...this.settings, preset: this.effectivePreset() });
       if (this.perf.noAnchors) params.anchors = false;
       if (this.perf.noHalf) params.multiscale = false;
+      if (this.perf.noEns4 && params.ensemble === 4) params.ensemble = true;
       if (this.perf.noEnsemble) params.ensemble = false;
       this.engine.setParams(params);
       if (this.engine.res !== old) this.flush();
@@ -205,6 +206,11 @@
         p.noAnchors = true;
         p.me = null;
         p.note = 'GPU 負荷が高いため「大きな動きを高精度に」を自動でオフにしました';
+        this.applyEngineParams();
+      } else if (this.engine.params.ensemble === 4 && !p.noEns4) {
+        p.noEns4 = true;
+        p.me = null;
+        p.note = 'GPU 負荷が高いため「左右反転でも推論」を自動でオフにしました';
         this.applyEngineParams();
       } else if (this.engine.params.ensemble && !p.noEnsemble) {
         p.noEnsemble = true;

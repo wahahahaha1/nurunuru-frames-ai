@@ -34,6 +34,7 @@
       // selection map: models fitted for the ensemble / for RIFE alone
       this.selectPipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.select, 'select'), entryPoint: 'main' } });
       this.selectPipePlain = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.selectPlain, 'select-plain'), entryPoint: 'main' } });
+      this.selectPipeEns4 = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.selectEns4, 'select-ens4'), entryPoint: 'main' } });
       this.combinePipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.combine, 'combine'), entryPoint: 'main' } });
       this.combine4Pipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.combine4, 'combine4'), entryPoint: 'main' } });
       this.bm = new S.BlockMatcher(device, this.samp);
@@ -338,7 +339,7 @@
       }
       if (useHalf) steps.push(...this.netH.job(a.tensorH, b.tensorH, { flowView: b.flowHView, maskView: b.maskHView, stats: this.res.scratchStats }));
       if (useBM) {
-        const pipe = useEns ? this.selectPipe : this.selectPipePlain;
+        const pipe = useEns === 4 ? this.selectPipeEns4 : useEns ? this.selectPipe : this.selectPipePlain;
         steps.push({
           key: 'sel',
           pipe,

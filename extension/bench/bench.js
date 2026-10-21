@@ -154,6 +154,7 @@
         if (preset === 'standard') {
           // optional parts at this preset
           const variants = [
+            ['＋ 左右反転でも推論（推論 4 回）', { hybrid: true, multiscale: true, ensemble: 4 }],
             ['入れ替えての推論なし', { hybrid: true, multiscale: true, ensemble: false }],
             ['半分の解像度での推論なし', { hybrid: true, multiscale: false, ensemble: true }],
             ['ハイブリッドなし（RIFE のみ）', { hybrid: false }],
