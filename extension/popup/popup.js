@@ -36,6 +36,8 @@
   function render() {
     $('enabled').checked = settings.enabled;
     $('target').value = settings.target;
+    $('gpuLimit').value = String(settings.gpuLimit);
+    $('bufferMs').value = String(settings.bufferMs);
     $('targetFps').value = settings.targetFps;
     $('targetFps').disabled = settings.target !== 'fixed';
     renderTargetHint();
@@ -60,6 +62,8 @@
   }
   for (const b of $('preset').children) b.onclick = () => save({ preset: b.dataset.v });
   $('target').onchange = (e) => save({ target: e.target.value });
+  $('gpuLimit').onchange = (e) => save({ gpuLimit: /^\d+$/.test(e.target.value) ? +e.target.value : e.target.value });
+  $('bufferMs').onchange = (e) => save({ bufferMs: +e.target.value });
   $('targetFps').onchange = (e) => save({ targetFps: Math.max(24, Math.min(500, Math.round(+e.target.value || 60))) });
   for (const id of ['masking', 'sceneSensitivity', 'audioOffsetMs']) {
     $(id).oninput = (e) => ($(id + 'Out').textContent = fmt[id](+e.target.value));

@@ -57,6 +57,33 @@
 </section>
 
 <section>
+  <div class="label">GPU 負荷の上限</div>
+  <div class="target">
+    <select id="gpuLimit">
+      <option value="auto">自動（70%）</option>
+      <option value="50">50%</option>
+      <option value="60">60%</option>
+      <option value="80">80%</option>
+      <option value="90">90%</option>
+      <option value="100">100%</option>
+      <option value="off">自動で軽くしない</option>
+    </select>
+  </div>
+  <div class="hint">補間の処理がこの割合を超える状態が 3 秒続くと、重い処理を順に自動でオフにします。上げるほど高精度の処理を保ちますが、ほかの処理と GPU を取り合ってカクつくことがあります。「自動で軽くしない」でも、推論がまったく終わらないときは止めます</div>
+  <div class="label">先読み（バッファ）</div>
+  <div class="target">
+    <select id="bufferMs">
+      <option value="0">なし（遅延が最小）</option>
+      <option value="100">0.1 秒</option>
+      <option value="200">0.2 秒</option>
+      <option value="300">0.3 秒</option>
+      <option value="500">0.5 秒</option>
+    </select>
+  </div>
+  <div class="hint">映像をこの時間だけ余分に遅らせ、そのぶん先に届いたフレームを処理しておきます。一瞬の処理落ち（アンダーラン）を吸収します。平均して GPU が足りない場合は解決しません。動画のフレームはブラウザが再生した時点で届くため、これより先は読めません。音ズレ補正をオンにすると音声も同じだけ遅らせます。GPU のメモリを余分に使います（標準・1080p で 1 フレームあたり 約 40 MB：0.3 秒なら 30 fps の動画で 約 350 MB、60 fps で 約 700 MB）</div>
+</section>
+
+<section>
   <div class="row"><span>音ズレ補正（音声を遅延・実験的）</span><label class="switch"><input type="checkbox" id="audioSync"><span></span></label></div>
   <div class="label">音声オフセット <output id="audioOffsetMsOut"></output></div>
   <input type="range" id="audioOffsetMs" min="-100" max="100" step="5">

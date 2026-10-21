@@ -16,6 +16,8 @@
     ensemble4: false, // with ensemble: also on the mirrored pair both ways (4x inference in all, for fast GPUs)
     masking: 0, // 0..100: show the nearer original frame where no motion is trusted
     sceneSensitivity: 60, // 0..100: higher = scene changes detected more readily
+    gpuLimit: 'auto', // 'auto' (70 %) | 40..100 (%) | 'off': GPU load at which optional processing is turned off automatically
+    bufferMs: 0, // extra output delay (ms) that absorbs momentary slowdowns (more frames are kept on the GPU)
     audioSync: false, // delay audio by the interpolation latency (routes the video's audio through WebAudio)
     audioOffsetMs: 0, // extra audio delay (+) or advance (-)
     demo: false, // split screen: left original, right interpolated
@@ -60,6 +62,7 @@
     multiscale: !!s.multiscale,
     ensemble: s.ensemble ? (s.ensemble4 ? 4 : true) : false,
     autotune: false, // measure the conv tilings on this GPU (once per model and size); off: no gain in the job on an RTX 3080
+    bufferMs: Math.max(0, Math.min(500, +s.bufferMs || 0)),
     masking: s.masking / 100,
     sceneFrac: 0.6 - (0.5 * s.sceneSensitivity) / 100, // default 60 -> 0.3 (normal pairs stay below ~0.1, cuts mostly above 0.45)
   });

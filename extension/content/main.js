@@ -8,7 +8,7 @@
   const audioByVideo = new WeakMap(); // a media element can be routed through WebAudio only once
   const PRESET_ORDER = ['fast', 'standard', 'quality'];
   const PRESET_NAMES = { fast: '速度優先', standard: '標準', quality: '高画質' };
-  const LOAD_LIMIT = 0.7; // share of GPU time interpolation may use before the guard steps in
+  const LOAD_LIMIT = 0.7; // share of GPU time interpolation may use before the guard steps in (gpuLimit 'auto')
   const TAG = '[NuruNuru Frames AI]';
 
   class Player {
@@ -96,7 +96,7 @@
 
     applySettings(s) {
       const o = this.settings;
-      const engineChanged = ['preset', 'hybrid', 'multiscale', 'anchors', 'ensemble', 'ensemble4'].some((k) => s[k] !== o[k]);
+      const engineChanged = ['preset', 'hybrid', 'multiscale', 'anchors', 'ensemble', 'ensemble4', 'gpuLimit'].some((k) => s[k] !== o[k]);
       if (engineChanged || this.perf.stopped) {
         // the user changed something: forget automatic downgrades (and a stop) and try again
         if (this.perf.stopped) this.failed = null;
@@ -119,6 +119,9 @@
       if (this.perf.noHalf) params.multiscale = false;
       if (this.perf.noEns4 && params.ensemble === 4) params.ensemble = true;
       if (this.perf.noEnsemble) params.ensemble = false;
+      // the buffer's frames, for 30 or 60 fps (fixed per tier so that the ring is not reallocated as
+      // the frame rate estimate settles)
+      params.bufferFrames = Math.ceil((params.bufferMs / 1000) * this.fpsTier());
       this.engine.setParams(params);
       if (this.engine.res !== old) this.flush();
       if (params.model !== this.engine.net.model && this.loadingModel !== params.model) {
@@ -137,6 +140,10 @@
           }
         );
       }
+    }
+
+    fpsTier() {
+      return this.clock.diffs.length && 1 / this.clock.frameDur > 32 ? 60 : 30;
     }
 
     effectivePreset() {
@@ -176,6 +183,15 @@
       return (p.me * rate + (p.render || 0) * this.outRate()) / 1000;
     }
 
+    // GPU load limit from the settings: 'auto' = LOAD_LIMIT, a percentage, or 'off' (only a GPU that
+    // finishes no inference at all makes the guard step in)
+    loadLimit() {
+      const g = this.settings.gpuLimit;
+      if (g === 'off') return Infinity;
+      const v = +g;
+      return g === 'auto' || !(v >= 10 && v <= 200) ? LOAD_LIMIT : v / 100;
+    }
+
     // Called once per second while interpolating. After 3 s over the limit: drop the optional extra
     // inferences (anchors, ensemble, half resolution), lower the preset, then halve the output frame rate,
     // then give up (show the original video). No finished inference for 5 s (a GPU too slow to even
@@ -196,7 +212,7 @@
       if (playing && wanted > 0) p.starve = finished === 0 ? p.starve + 1 : 0;
       const starving = p.starve >= 5;
       if (load == null && !starving) return;
-      p.over = starving || load > LOAD_LIMIT ? p.over + 1 : 0;
+      p.over = starving || (load != null && load > this.loadLimit()) ? p.over + 1 : 0;
       if (p.over < 3) return;
       p.over = 0;
       p.starve = 0;
@@ -339,6 +355,8 @@
         }
         // inference latency allowance: up at once, down slowly (the chunk count varies job to job)
         const want = this.engine.chunks * c.vsync;
+        c.buffer = ((this.settings.bufferMs || 0) / 1000) * this.video.playbackRate;
+        c.keep = this.engine.ringSize - 1;
         c.extra = want >= c.extra ? want : Math.max(want, c.extra - 0.02 * c.vsync);
       }
     }
@@ -353,7 +371,6 @@
       }
       if (reason) {
         this.audio.set(0);
-        this.audioHeld = null;
         this.updateOSD(ts);
         return;
       }
@@ -422,20 +439,9 @@
       if (paired && sel.t > 0) this.stats.interp++;
       if (s.audioSync) {
         this.audio.enable();
-        // follow increases of the video delay, but decreases only once they have lasted 3 s (the
-        // delay steps up and down with the drawing cadence and the inference split; each audio
-        // delay change has to glide slowly to stay inaudible)
-        const want = c.delay / Math.max(0.1, v.playbackRate) + s.audioOffsetMs / 1000;
-        if (this.audioHeld == null || want >= this.audioHeld) {
-          this.audioHeld = want;
-          this.audioLowSince = null;
-        } else if (this.audioLowSince == null) {
-          this.audioLowSince = ts;
-        } else if (ts - this.audioLowSince > 3000) {
-          this.audioHeld = want;
-          this.audioLowSince = null;
-        }
-        this.audio.set(this.audioHeld);
+        // the video delay steps up and down with the drawing cadence, the inference split and the
+        // underrun margin; the audio delay follows it with hysteresis (see AudioDelay.follow)
+        this.audio.follow(c.delay / Math.max(0.1, v.playbackRate) + s.audioOffsetMs / 1000, ts);
       }
       this.updateOSD(ts);
     }
@@ -453,6 +459,7 @@
         if (c.underruns === this.lastUnderruns) c.margin = Math.max(0, c.margin - 0.0005);
         this.lastUnderruns = c.underruns;
         if (!this.reason && !this.video.paused && this.ready) this.checkPerf();
+        if (this.engine && this.settings.bufferMs > 0 && Math.ceil((this.settings.bufferMs / 1000) * this.fpsTier()) !== this.engine.params.bufferFrames) this.applyEngineParams();
         if (this.osd.on) this.osd.update(this.statusText());
       }
     }
@@ -475,7 +482,7 @@
         delayMs: c.delay * 1000,
         audio: this.settings.audioSync ? this.audio.state : 'off',
         // audio delay being applied (the video delay + user offset, held and glided) once the WebAudio route is active
-        audioDelayMs: this.settings.audioSync && this.audio.active && !this.reason && this.audioHeld != null ? this.audioHeld * 1000 : 0,
+        audioDelayMs: this.settings.audioSync && this.audio.active && !this.reason ? this.audio.delay * 1000 : 0,
         underruns: c.underruns,
         drops: c.drops,
         errors: this.errors,

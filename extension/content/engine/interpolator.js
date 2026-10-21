@@ -142,7 +142,8 @@
     setParams(params) {
       const old = this.params;
       this.params = { ...this.params, ...params };
-      if (this.res && (old.maxFrameWidth !== this.params.maxFrameWidth || old.modelWidth !== this.params.modelWidth)) {
+      const keys = ['maxFrameWidth', 'modelWidth', 'bufferFrames'];
+      if (this.res && keys.some((k) => old[k] !== this.params[k])) {
         const { srcW, srcH } = this.res;
         this.destroyResources();
         this.configure(srcW, srcH);
@@ -181,7 +182,7 @@
       const tensorUM = uni(new Uint32Array([mw, mh, pw, ph, Math.max(1, Math.min(4, Math.round(fw / mw))), 1, 0, 0])); // mirrored
       const tensorUH = uni(new Uint32Array([half.cw, half.ch, half.pw, half.ph, Math.max(1, Math.min(4, Math.round(fw / half.cw))), 0, 0, 0]));
       const frames = [];
-      for (let s = 0; s < RING; s++) {
+      for (let s = 0; s < this.ringSize; s++) {
         const tex = d.createTexture({
           size: [fw, fh],
           format: 'rgba8unorm',
@@ -224,17 +225,7 @@
             { binding: 3, resource: { buffer: tensorUH } },
           ],
         });
-        fr.anchors = ANCHORS.map((ts) => {
-          const an = {
-            ts,
-            flow: d.createTexture({ size: [mw, mh], format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
-            mask: d.createTexture({ size: [mw, mh], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
-            ready: false,
-          };
-          an.flowView = an.flow.createView();
-          an.maskView = an.mask.createView();
-          return an;
-        });
+        fr.anchors = ANCHORS.map((ts) => ({ ts, flow: null, mask: null, ready: false })); // textures allocated when first needed
         fr.tensorBG = d.createBindGroup({
           layout: this.tensorPipe.getBindGroupLayout(0),
           entries: [
@@ -439,6 +430,12 @@
       steps.mainEnd = steps.length;
       if (useAnchors) {
         for (const an of b.anchors) {
+          if (!an.flow) {
+            an.flow = this.device.createTexture({ size: [r.mw, r.mh], format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING });
+            an.mask = this.device.createTexture({ size: [r.mw, r.mh], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING });
+            an.flowView = an.flow.createView();
+            an.maskView = an.mask.createView();
+          }
           const js = this.net.job(a.tensor, b.tensor, { flowView: an.flowView, maskView: an.maskView, stats: this.res.scratchStats }, an.ts);
           const id = b.id;
           js[js.length - 1].after = () => {
@@ -467,8 +464,8 @@
         f.maskH.destroy();
         f.stats.destroy();
         for (const an of f.anchors) {
-          an.flow.destroy();
-          an.mask.destroy();
+          if (an.flow) an.flow.destroy();
+          if (an.mask) an.mask.destroy();
         }
       }
       this.res.scratchStats.destroy();
@@ -536,7 +533,7 @@
       const d = this.device;
       const r = this.res;
       const f = r.frames[r.next];
-      r.next = (r.next + 1) % RING;
+      r.next = (r.next + 1) % r.frames.length;
       f.id = ++this.seq;
       f.hasPair = false;
       f.hasSel = false;
@@ -629,6 +626,11 @@
       if (job.measure) job.ms = new Array(steps.length).fill(0);
     }
 
+    // Ring slots: the base plus the frames of the user's buffer (params.bufferFrames).
+    get ringSize() {
+      return RING + (this.params.bufferFrames || 0);
+    }
+
     // A frame record stays usable until its slot is reused.
     isLive(frame) {
       return !!this.res && this.res.frames[frame.slot] === frame && frame.id > 0;
@@ -646,8 +648,9 @@
     pump(vsyncMs, srcMs) {
       const d = this.device;
       this.jobs = this.jobs.filter((j) => j.a.id === j.aId && j.b.id === j.bId && this.isLive(j.a) && this.isLive(j.b));
-      // behind: skip pairs rather than lag further, but finish the one already under way
-      while (this.jobs.length > 2) {
+      // behind: skip pairs rather than lag further (beyond what the user's buffer allows), but finish
+      // the one already under way
+      while (this.jobs.length > 2 + (this.params.bufferFrames || 0)) {
         const [j] = this.jobs.splice(this.jobs[0].next > 0 ? 1 : 0, 1);
         if (j.b.dupState !== 'dup') this.demand++;
       }

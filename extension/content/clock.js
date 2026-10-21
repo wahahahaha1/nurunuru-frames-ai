@@ -6,7 +6,6 @@
 // skipped, so pairs span distinct drawings, and the delay grows to the longest recent span.
 (() => {
   const S = (globalThis.NNF = globalThis.NNF || {});
-  const KEEP = 7; // must stay below the interpolator's ring size (8)
   const MAX_SPAN = 3.5; // longest span between drawings that is interpolated over, in source frames
 
   const stateOf = (rec) => (rec.f ? rec.f.dupState || 'distinct' : 'distinct');
@@ -18,6 +17,8 @@
       this.vsync = 1 / 60;
       this.margin = 0;
       this.extra = 0; // inference pipeline latency (seconds), set by the player
+      this.buffer = 0; // extra delay chosen by the user (media seconds), set by the player
+      this.keep = 7; // frames kept, set by the player (below the interpolator's ring size)
       this.underruns = 0;
       this.drops = 0;
     }
@@ -78,7 +79,7 @@
     push(rec) {
       this.count++;
       this.frames.push(rec);
-      while (this.frames.length > KEEP) this.frames.shift();
+      while (this.frames.length > this.keep) this.frames.shift();
     }
 
     // Feed the media clock with (display time, media time) of a presented frame.
@@ -101,9 +102,10 @@
     }
 
     // Output delay in media seconds: one drawing span + one display frame of jitter allowance
-    // + the inference pipeline latency + whatever extra the underrun detector has added.
+    // + the inference pipeline latency + whatever extra the underrun detector has added + the
+    // user's buffer.
     get delay() {
-      return this.spanDur + this.vsync + 0.001 + this.extra + this.margin;
+      return this.spanDur + this.vsync + 0.001 + this.extra + this.margin + this.buffer;
     }
 
     // Distinct drawings among the kept frames (records whose duplicate test is still pending are left
