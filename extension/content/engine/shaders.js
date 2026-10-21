@@ -169,14 +169,17 @@ fn pixel(x: u32, y: u32) -> array<f32, 28> {
 `;
 
   // 3x3 convolution (padding 1, stride 1 or 2) + bias [+ residual] [+ LeakyReLU(0.2)].
-  // Workgroup: TX x TY threads, each computing PX x PY pixels (spaced TX / TY apart) x 16 output
-  // channels; the input tile (CI channels at a time) and its weights are staged in shared memory.
-  // Split-K (small layers, to keep the GPU busy): workgroup z = cog + ncog * ks covers input
-  // channels [ks * cinPer, (ks + 1) * cinPer) and, with partial = 1, writes its raw sums to slice
-  // ks of the output; convReduce then adds the slices, bias, residual and activation.
+  // Workgroup: TX x TY threads, each computing PX x PY pixels (spaced TX / TY apart) x CO output
+  // channels (CO = 16 or 32: one or two groups of 16); the input tile (CI channels at a time) and its
+  // weights are staged in shared memory.
+  // Split-K (small layers, to keep the GPU busy): workgroup z = g + ng * ks (ng = number of output
+  // channel groups of CO) covers input channels [ks * cinPer, (ks + 1) * cinPer) and, with partial = 1,
+  // writes its raw sums to slice ks of the output; convReduce then adds the slices, bias, residual and
+  // activation.
   // Weights: vec4 index wOff + ((cog * cin + ci) * 9 + tap) * 4 + v holds output channels
-  // cog * 16 + v * 4 + 0..3; bias: vec4 index bOff + cog * 4 + v.
-  function conv({ stride, tx, ty, px, py, ci }) {
+  // cog * 16 + v * 4 + 0..3 (cog = group of 16); bias: vec4 index bOff + cog * 4 + v.
+  function conv({ stride, tx, ty, px, py, ci, co = 16 }) {
+    const G = co / 16;
     const TW = tx * px;
     const TH = ty * py;
     const IW = (TW - 1) * stride + 3;
@@ -184,12 +187,18 @@ fn pixel(x: u32, y: u32) -> array<f32, 28> {
     const NT = tx * ty;
     const pix = [];
     for (let j = 0; j < py; j++) for (let i = 0; i < px; i++) pix.push([i, j]);
-    const accDecl = pix.map((_, k) => `var a${k}0 = vec4f(0.0); var a${k}1 = vec4f(0.0); var a${k}2 = vec4f(0.0); var a${k}3 = vec4f(0.0);`).join('\n  ');
+    const groups = [...Array(G).keys()];
+    const accDecl = pix
+      .map((_, k) => groups.map((g) => `var a${k}_${g}_0 = vec4f(0.0); var a${k}_${g}_1 = vec4f(0.0); var a${k}_${g}_2 = vec4f(0.0); var a${k}_${g}_3 = vec4f(0.0);`).join(' '))
+      .join('\n  ');
+    const wLoad = groups
+      .map((g) => `let w${g}0 = sW[${g * ci * 36}u + wb]; let w${g}1 = sW[${g * ci * 36}u + wb + 1u]; let w${g}2 = sW[${g * ci * 36}u + wb + 2u]; let w${g}3 = sW[${g * ci * 36}u + wb + 3u];`)
+      .join('\n          ');
     const inner = pix
       .map(
         ([i, j], k) => `{
             let v = sIn[cb + (${j * ty}u + lid.y) * ${stride}u * ${IW}u + ky * ${IW}u + (${i * tx}u + lid.x) * ${stride}u + kx];
-            a${k}0 += v * w0; a${k}1 += v * w1; a${k}2 += v * w2; a${k}3 += v * w3;
+            ${groups.map((g) => `a${k}_${g}_0 += v * w${g}0; a${k}_${g}_1 += v * w${g}1; a${k}_${g}_2 += v * w${g}2; a${k}_${g}_3 += v * w${g}3;`).join(' ')}
           }`
       )
       .join('\n          ');
@@ -199,7 +208,7 @@ fn pixel(x: u32, y: u32) -> array<f32, 28> {
     let ox = ox0 + ${i * tx}u + lid.x;
     let oy = oy0 + ${j * ty}u + lid.y;
     if (ox < U.ow && oy < U.oh) {
-      emit(a${k}0, 0u, ox, oy); emit(a${k}1, 1u, ox, oy); emit(a${k}2, 2u, ox, oy); emit(a${k}3, 3u, ox, oy);
+      ${groups.map((g) => `emit(a${k}_${g}_0, cog0 + ${g}u, 0u, ox, oy); emit(a${k}_${g}_1, cog0 + ${g}u, 1u, ox, oy); emit(a${k}_${g}_2, cog0 + ${g}u, 2u, ox, oy); emit(a${k}_${g}_3, cog0 + ${g}u, 3u, ox, oy);`).join('\n      ')}
     }
   }`
       )
@@ -216,12 +225,12 @@ struct CU {
 @group(0) @binding(4) var<storage, read_write> outp: array<f32>;
 
 var<workgroup> sIn: array<f32, ${ci * IW * IH}>;
-var<workgroup> sW: array<vec4f, ${ci * 36}>;
+var<workgroup> sW: array<vec4f, ${G * ci * 36}>;
 
-var<private> cog: u32;
 var<private> ks: u32;
 
-fn emit(acc: vec4f, v: u32, ox: u32, oy: u32) {
+fn emit(acc: vec4f, cog: u32, v: u32, ox: u32, oy: u32) {
+  if (cog * 16u >= U.cout) { return; }
   if (U.partial == 1u) {
     for (var e = 0u; e < 4u; e++) {
       let co = cog * 16u + v * 4u + e;
@@ -243,11 +252,12 @@ fn emit(acc: vec4f, v: u32, ox: u32, oy: u32) {
 }
 
 @compute @workgroup_size(${tx}, ${ty}) fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u, @builtin(local_invocation_index) tid: u32) {
-  cog = wg.z % U.ncog;
+  let cog0 = (wg.z % U.ncog) * ${G}u; // first group of 16 output channels
   let kz = wg.z / U.ncog; // workgroup-uniform (the loop below contains barriers)
   ks = kz;
   let cBeg = kz * U.cinPer;
   let cEnd = min(U.cin, cBeg + U.cinPer);
+  let ngroups = (U.cout + 15u) / 16u;
   let ox0 = wg.x * ${TW}u;
   let oy0 = wg.y * ${TH}u;
   let ix0 = i32(ox0 * ${stride}u) - 1;
@@ -266,10 +276,12 @@ fn emit(acc: vec4f, v: u32, ox: u32, oy: u32) {
       }
       sIn[k] = v;
     }
-    for (var k = tid; k < ${ci * 36}u; k += ${NT}u) {
-      let c = c0 + k / 36u;
+    for (var k = tid; k < ${G * ci * 36}u; k += ${NT}u) {
+      let g = k / ${ci * 36}u;
+      let kk = k % ${ci * 36}u;
+      let c = c0 + kk / 36u;
       var w = vec4f(0.0);
-      if (c < cEnd) { w = wts[U.wOff + (cog * U.cin + c) * 36u + k % 36u]; }
+      if (c < cEnd && cog0 + g < ngroups) { w = wts[U.wOff + ((cog0 + g) * U.cin + c) * 36u + kk % 36u]; }
       sW[k] = w;
     }
     workgroupBarrier();
@@ -278,10 +290,7 @@ fn emit(acc: vec4f, v: u32, ox: u32, oy: u32) {
       for (var ky = 0u; ky < 3u; ky++) {
         for (var kx = 0u; kx < 3u; kx++) {
           let wb = (cc * 9u + ky * 3u + kx) * 4u;
-          let w0 = sW[wb];
-          let w1 = sW[wb + 1u];
-          let w2 = sW[wb + 2u];
-          let w3 = sW[wb + 3u];
+          ${wLoad}
           ${inner}
         }
       }

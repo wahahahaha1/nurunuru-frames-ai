@@ -120,6 +120,85 @@
   const blockName = (s, net) =>
     s.block === -2 ? 'ブロックマッチング・選択マップ' : s.block < 0 ? '特徴抽出（Head）' : `RIFE 段 ${s.block + 1}（1/${net.spec.scales[s.block]} 解像度）`;
 
+  // Kernel variants of the 3x3 convolution, timed on the heaviest distinct conv layers of the job
+  // (real weights, no split-K): which tiling suits this GPU.
+  const CANDIDATES = {
+    1: [
+      { tx: 16, ty: 8, px: 2, py: 2, ci: 4, co: 16 },
+      { tx: 16, ty: 8, px: 2, py: 2, ci: 4, co: 32 },
+      { tx: 16, ty: 8, px: 2, py: 1, ci: 4, co: 32 },
+      { tx: 8, ty: 8, px: 2, py: 2, ci: 4, co: 32 },
+      { tx: 16, ty: 16, px: 2, py: 1, ci: 4, co: 16 },
+      { tx: 16, ty: 16, px: 2, py: 1, ci: 4, co: 32 },
+      { tx: 16, ty: 8, px: 2, py: 2, ci: 2, co: 32 },
+      { tx: 8, ty: 8, px: 4, py: 2, ci: 4, co: 16 },
+    ],
+    2: [
+      { tx: 8, ty: 8, px: 2, py: 2, ci: 2, co: 16 },
+      { tx: 8, ty: 8, px: 2, py: 2, ci: 2, co: 32 },
+      { tx: 8, ty: 8, px: 2, py: 2, ci: 4, co: 16 },
+      { tx: 16, ty: 8, px: 2, py: 2, ci: 2, co: 16 },
+      { tx: 16, ty: 8, px: 2, py: 1, ci: 2, co: 32 },
+      { tx: 8, ty: 8, px: 1, py: 1, ci: 8, co: 32 },
+    ],
+  };
+  const cfgName = (c) => `${c.tx}×${c.ty} 画素${c.px}×${c.py} 入力${c.ci} 出力${c.co}`;
+  const smem = (c, stride) => 4 * (c.ci * ((c.tx * c.px - 1) * stride + 3) * ((c.ty * c.py - 1) * stride + 3) + (c.co / 16) * c.ci * 36 * 4);
+
+  async function sweep(device, net, steps, per) {
+    if (!device.features.has('timestamp-query')) return;
+    const seen = new Set();
+    const layers = steps
+      .map((s, i) => ({ s, ms: per[i] }))
+      .filter(({ s }) => s.layer)
+      .sort((x, y) => y.ms - x.ms)
+      .filter(({ s }) => {
+        const k = `${s.layer.L.cin}/${s.layer.L.cout}/${s.layer.stride}/${s.layer.ow}/${s.layer.oh}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      })
+      .slice(0, 4);
+    const tbody = $('sweep').querySelector('tbody');
+    tbody.innerHTML = '';
+    $('sweep').hidden = false;
+    $('sweepTitle').hidden = false;
+    const BU = GPUBufferUsage;
+    const pipes = new Map();
+    for (const { s } of layers) {
+      const { L, stride, iw, ih, ow, oh } = s.layer;
+      const inp = device.createBuffer({ size: L.cin * iw * ih * 4, usage: BU.STORAGE });
+      const out = device.createBuffer({ size: L.cout * ow * oh * 4, usage: BU.STORAGE });
+      const res = device.createBuffer({ size: L.cout * ow * oh * 4, usage: BU.STORAGE });
+      for (const c of CANDIDATES[stride]) {
+        if (smem(c, stride) > device.limits.maxComputeWorkgroupStorageSize) continue;
+        const key = JSON.stringify({ ...c, stride });
+        if (!pipes.has(key)) {
+          pipes.set(key, device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code: S.WGSL.conv({ ...c, stride }) }), entryPoint: 'main' } }));
+        }
+        const pipe = pipes.get(key);
+        const ncog = Math.ceil(L.cout / c.co);
+        const u = device.createBuffer({ size: 64, usage: BU.UNIFORM | BU.COPY_DST });
+        device.queue.writeBuffer(u, 0, new Uint32Array([L.cin, L.cout, iw, ih, ow, oh, L.wOff, L.bOff, stride === 1 ? 1 : 0, 1, ncog, L.cin, 0, 0, 0, 0]));
+        const bg = device.createBindGroup({
+          layout: pipe.getBindGroupLayout(0),
+          entries: [u, inp, net.wbuf, res, out].map((b, i) => ({ binding: i, resource: { buffer: b } })),
+        });
+        const wg = [Math.ceil(ow / (c.tx * c.px)), Math.ceil(oh / (c.ty * c.py)), ncog];
+        const step = { pipe, bg, wg };
+        await timeGroups(device, [[step]]);
+        const times = [];
+        for (let r = 0; r < 5; r++) times.push((await timeGroups(device, [[step, step, step, step]]))[0] / 4);
+        const ms = median(times);
+        const flops = (2 * L.cin * L.cout * 9 * ow * oh) / ms / 1e9;
+        tbody.insertAdjacentHTML('beforeend', `<tr><td>${s.key} ${L.cin}→${L.cout} ${ow}×${oh}${stride === 2 ? ' 間引き' : ''}</td><td>${cfgName(c)}</td><td>${ms.toFixed(3)} ms</td><td>${flops.toFixed(2)} TFLOPS</td></tr>`);
+        log(`sweep ${s.key} ${L.cin}-${L.cout} ${ow}x${oh} s${stride} ${c.tx}x${c.ty} p${c.px}x${c.py} ci${c.ci} co${c.co}: ${ms.toFixed(3)} ms`);
+        u.destroy();
+      }
+      [inp, out, res].forEach((b) => b.destroy());
+    }
+  }
+
   async function run() {
     $('run').disabled = true;
     $('log').textContent = '';
@@ -190,6 +269,7 @@
             $('hot').hidden = false;
             $('hotTitle').hidden = false;
             log('hot: ' + hot.map(({ s, ms }) => `${s.key}=${ms.toFixed(2)}`).join(' '));
+            await sweep(device, net, j.steps, per);
           }
         }
         j.eng.destroy();

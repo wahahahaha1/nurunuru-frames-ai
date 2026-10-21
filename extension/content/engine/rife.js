@@ -26,12 +26,13 @@
   const TARGET_WG = 512;
 
   // Shader variant, workgroup grid and split-K factor of a 3x3 conv layer.
-  function convPlan(L, stride, ow, oh) {
+  function convPlan(L, stride, ow, oh, cfgs = CONV_CFG) {
     const tiles = (cfg) => Math.ceil(ow / (cfg.tx * cfg.px)) * Math.ceil(oh / (cfg.ty * cfg.py));
-    const ncog = Math.ceil(L.cout / 16);
+    const groups = (cfg) => Math.ceil(L.cout / (cfg.co || 16));
     let key = stride === 1 ? 'conv1' : 'conv2';
-    if (stride === 1 && tiles(CONV_CFG.conv1) * ncog < TARGET_WG / 2) key = 'conv1s';
-    const cfg = CONV_CFG[key];
+    if (stride === 1 && tiles(cfgs.conv1) * groups(cfgs.conv1) < TARGET_WG / 2) key = 'conv1s';
+    const cfg = cfgs[key];
+    const ncog = groups(cfg);
     const wgs = tiles(cfg) * ncog;
     let ks = Math.max(1, Math.min(8, Math.floor(L.cin / (cfg.ci * 4)), Math.ceil(TARGET_WG / wgs)));
     const cinPer = Math.ceil(L.cin / ks / cfg.ci) * cfg.ci;
@@ -305,7 +306,8 @@
         const u = uni(new Uint32Array([L.cin, L.cout, iw, ih, ow, oh, L.wOff, L.bOff, resBuf ? 1 : 0, 1, c.ncog, c.cinPer, split ? 1 : 0, 0, 0, 0]));
         const kind = stride === 1 ? 'conv1' : 'conv2';
         const variant = `${c.key} ${L.cin}→${L.cout} ${ow}×${oh}${split ? ` k${c.ks}` : ''}`; // (for profiling)
-        const conv = { key: this.keyPrefix + key, pipe, block, kind, variant, bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, split ? bufs.part : outBuf]), wg: c.wg, cost: L.cin * L.cout * 9 * ow * oh };
+        const layer = { L, stride, iw, ih, ow, oh }; // (for the benchmark's kernel sweep)
+        const conv = { key: this.keyPrefix + key, pipe, block, kind, variant, layer, bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, split ? bufs.part : outBuf]), wg: c.wg, cost: L.cin * L.cout * 9 * ow * oh };
         if (!split) return [conv];
         const n = L.cout * ow * oh;
         const ru = uni(new Uint32Array([n, ow * oh, c.ks, resBuf ? 1 : 0, L.bOff, 1, 0, 0]));
@@ -467,4 +469,6 @@
   }
 
   S.RifeNet = RifeNet;
+  S.convPlan = convPlan;
+  S.CONV_CFG = CONV_CFG;
 })();
