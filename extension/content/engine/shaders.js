@@ -77,7 +77,7 @@ struct TU { cw: u32, ch: u32, pw: u32, ph: u32, taps: u32, mirror: u32, pad1: u3
   // Frame tensors hold RGB (planes 0-2) and the Head features (planes 3-6). Warping = bilinear
   // sampling at x + flow with border clamp (grid_sample, align_corners=True).
   const prep = /* wgsl */ `
-struct PU { pw: u32, ph: u32, bw: u32, bh: u32, scale: f32, first: u32, ts: f32, pad1: u32 };
+struct PU { pw: u32, ph: u32, bw: u32, bh: u32, scale: f32, first: u32, ts: f32, pad1: u32, xOff: u32, fmOff: u32, pad2: u32, pad3: u32 };
 @group(0) @binding(0) var<uniform> U: PU;
 @group(0) @binding(1) var<storage, read> img0: array<f32>;
 @group(0) @binding(2) var<storage, read> img1: array<f32>;
@@ -125,7 +125,7 @@ fn pixel(x: u32, y: u32) -> array<f32, 28> {
       fb[c] = img1[(3u + c) * plane + i];
     }
   } else {
-    flow = vec4f(fm[i], fm[plane + i], fm[2u * plane + i], fm[3u * plane + i]);
+    flow = vec4f(fm[U.fmOff + i], fm[U.fmOff + plane + i], fm[U.fmOff + 2u * plane + i], fm[U.fmOff + 3u * plane + i]);
     let p = vec2f(f32(x), f32(y));
     a = sample4(0u, 0u, p + flow.xy);
     b = sample4(1u, 0u, p + flow.zw);
@@ -136,7 +136,7 @@ fn pixel(x: u32, y: u32) -> array<f32, 28> {
   for (var c = 0u; c < 4u; c++) { v[6u + c] = fa[c]; v[10u + c] = fb[c]; }
   v[14] = U.ts;
   if (U.first == 0u) {
-    for (var c = 0u; c < 9u; c++) { v[15u + c] = fm[(4u + c) * plane + i]; } // mask + 8 features
+    for (var c = 0u; c < 9u; c++) { v[15u + c] = fm[U.fmOff + (4u + c) * plane + i]; } // mask + 8 features
     for (var c = 0u; c < 4u; c++) { v[24u + c] = flow[c]; }
   }
   return v;
@@ -163,7 +163,7 @@ fn pixel(x: u32, y: u32) -> array<f32, 28> {
   for (var c = 0u; c < n; c++) {
     var r = v[c];
     if (c >= 24u) { r = r / U.scale; }
-    outX[c * plane + o] = r;
+    outX[U.xOff + c * plane + o] = r;
   }
 }
 `;
@@ -175,7 +175,8 @@ fn pixel(x: u32, y: u32) -> array<f32, 28> {
   // Split-K (small layers, to keep the GPU busy): workgroup z = g + ng * ks (ng = number of output
   // channel groups of CO) covers input channels [ks * cinPer, (ks + 1) * cinPer) and, with partial = 1,
   // writes its raw sums to slice ks of the output; convReduce then adds the slices, bias, residual and
-  // activation.
+  // activation. Batch: z also counts the item (z = g + ng * (ks + nks * item)); each item's input,
+  // residual and output follow the previous item's in the same buffers.
   // Weights: vec4 index wOff + ((cog * cin + ci) * 9 + tap) * 4 + v holds output channels
   // cog * 16 + v * 4 + 0..3 (cog = group of 16); bias: vec4 index bOff + cog * 4 + v.
   function conv({ stride, tx, ty, px, py, ci, co = 16 }) {
@@ -216,7 +217,7 @@ fn pixel(x: u32, y: u32) -> array<f32, 28> {
     return /* wgsl */ `
 struct CU {
   cin: u32, cout: u32, iw: u32, ih: u32, ow: u32, oh: u32, wOff: u32, bOff: u32,
-  res: u32, leaky: u32, ncog: u32, cinPer: u32, partial: u32, pad0: u32, pad1: u32, pad2: u32,
+  res: u32, leaky: u32, ncog: u32, cinPer: u32, partial: u32, nks: u32, pad1: u32, pad2: u32,
 };
 @group(0) @binding(0) var<uniform> U: CU;
 @group(0) @binding(1) var<storage, read> inp: array<f32>;
@@ -228,6 +229,8 @@ var<workgroup> sIn: array<f32, ${ci * IW * IH}>;
 var<workgroup> sW: array<vec4f, ${G * ci * 36}>;
 
 var<private> ks: u32;
+var<private> outBase: u32; // this item's output / residual
+var<private> resBase: u32;
 
 fn emit(acc: vec4f, cog: u32, v: u32, ox: u32, oy: u32) {
   if (cog * 16u >= U.cout) { return; }
@@ -235,7 +238,7 @@ fn emit(acc: vec4f, cog: u32, v: u32, ox: u32, oy: u32) {
     for (var e = 0u; e < 4u; e++) {
       let co = cog * 16u + v * 4u + e;
       if (co >= U.cout) { break; }
-      outp[((ks * U.cout + co) * U.oh + oy) * U.ow + ox] = acc[e];
+      outp[outBase + ((ks * U.cout + co) * U.oh + oy) * U.ow + ox] = acc[e];
     }
     return;
   }
@@ -245,15 +248,21 @@ fn emit(acc: vec4f, cog: u32, v: u32, ox: u32, oy: u32) {
     if (co >= U.cout) { break; }
     let o = (co * U.oh + oy) * U.ow + ox;
     var r = y[e];
-    if (U.res == 1u) { r += resid[o]; }
+    if (U.res == 1u) { r += resid[resBase + o]; }
     if (U.leaky == 1u) { r = max(r, 0.2 * r); }
-    outp[o] = r;
+    outp[outBase + o] = r;
   }
 }
 
 @compute @workgroup_size(${tx}, ${ty}) fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u, @builtin(local_invocation_index) tid: u32) {
-  let cog0 = (wg.z % U.ncog) * ${G}u; // first group of 16 output channels
-  let kz = wg.z / U.ncog; // workgroup-uniform (the loop below contains barriers)
+  let zPer = U.ncog * U.nks;
+  let item = wg.z / zPer;
+  let zz = wg.z % zPer;
+  let cog0 = (zz % U.ncog) * ${G}u; // first group of 16 output channels
+  let kz = zz / U.ncog; // workgroup-uniform (the loop below contains barriers)
+  let inBase = item * U.cin * U.ih * U.iw;
+  resBase = item * U.cout * U.oh * U.ow;
+  outBase = resBase * select(1u, U.nks, U.partial == 1u);
   ks = kz;
   let cBeg = kz * U.cinPer;
   let cEnd = min(U.cin, cBeg + U.cinPer);
@@ -272,7 +281,7 @@ fn emit(acc: vec4f, cog: u32, v: u32, ox: u32, oy: u32) {
       let y = iy0 + i32(r / ${IW}u);
       var v = 0.0;
       if (c < cEnd && x >= 0 && y >= 0 && x < i32(U.iw) && y < i32(U.ih)) {
-        v = inp[(c * U.ih + u32(y)) * U.iw + u32(x)];
+        v = inp[inBase + (c * U.ih + u32(y)) * U.iw + u32(x)];
       }
       sIn[k] = v;
     }
@@ -313,12 +322,13 @@ struct RU { n: u32, plane: u32, ks: u32, res: u32, bOff: u32, leaky: u32, pad0: 
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) g: vec3u) {
   let i = g.x;
   if (i >= U.n) { return; }
+  let item = g.y; // (batch: items one after another)
   let co = i / U.plane;
   var r = wts[U.bOff + co / 4u][co % 4u];
-  for (var s = 0u; s < U.ks; s++) { r += part[s * U.n + i]; }
-  if (U.res == 1u) { r += resid[i]; }
+  for (var s = 0u; s < U.ks; s++) { r += part[(item * U.ks + s) * U.n + i]; }
+  if (U.res == 1u) { r += resid[item * U.n + i]; }
   if (U.leaky == 1u) { r = max(r, 0.2 * r); }
-  outp[i] = r;
+  outp[item * U.n + i] = r;
 }
 `;
 
@@ -330,14 +340,15 @@ struct RU { n: u32, plane: u32, ks: u32, res: u32, bOff: u32, leaky: u32, pad0: 
   // parity class of (x, y), so all its threads use the same 2x2 taps and weights; those are staged in
   // shared memory, CH input channels at a time.
   // Split-K: dispatch z = parity + 4 * ks covers input channels [ks * cinPer, ...) and writes slice ks
-  // of the output (bias in slice 0 only); the slices are summed afterwards.
+  // of the output (bias in slice 0 only); the slices are summed afterwards. Batch: z = parity + 4 * (ks
+  // + nks * item).
   function deconv(NC) {
     const NV = Math.ceil(NC / 4);
     const CH = 8;
     const accs = [];
     for (let s = 0; s < 4; s++) for (let v = 0; v < NV; v++) accs.push([s, v]);
     return /* wgsl */ `
-struct DU { cin: u32, fw: u32, fh: u32, wOff: u32, bOff: u32, cinPer: u32, pad1: u32, pad2: u32 };
+struct DU { cin: u32, fw: u32, fh: u32, wOff: u32, bOff: u32, cinPer: u32, nks: u32, pad2: u32 };
 @group(0) @binding(0) var<uniform> U: DU;
 @group(0) @binding(1) var<storage, read> feat: array<f32>;
 @group(0) @binding(2) var<storage, read> wts: array<vec4f>;
@@ -348,7 +359,9 @@ var<workgroup> sW: array<vec4f, ${CH * 16 * NV}>;
 
 @compute @workgroup_size(8, 8) fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u, @builtin(local_invocation_index) tid: u32) {
   let par = wg.z % 4u;
-  let ks = wg.z / 4u; // workgroup-uniform (the loop below contains barriers)
+  let ks = (wg.z / 4u) % U.nks; // workgroup-uniform (the loop below contains barriers)
+  let item = wg.z / (4u * U.nks);
+  let fBase = item * U.cin * U.fh * U.fw;
   let px = par & 1u;
   let py = par >> 1u;
   let m = wg.x * 8u + lid.x; // feature column / row of this position
@@ -389,7 +402,7 @@ var<workgroup> sW: array<vec4f, ${CH * 16 * NV}>;
           if (iy[j] < 0 || iy[j] >= i32(U.fh)) { continue; }
           for (var i = 0u; i < 2u; i++) {
             if (ix[i] < 0 || ix[i] >= i32(U.fw)) { continue; }
-            let f = feat[(c * U.fh + u32(iy[j])) * U.fw + u32(ix[i])];
+            let f = feat[fBase + (c * U.fh + u32(iy[j])) * U.fw + u32(ix[i])];
             let wb = (cc * 4u + j * 2u + i) * ${4 * NV}u;
             ${accs.map(([s, v]) => `a${s}_${v} += f * sW[wb + ${s * NV + v}u];`).join(' ')}
           }
@@ -407,7 +420,7 @@ var<workgroup> sW: array<vec4f, ${CH * 16 * NV}>;
       const lines = [];
       for (let c = 0; c < NC; c++) lines.push(`outT[o${s} + ${c}u * plane] = a${s}_${c >> 2}[${c & 3}];`);
       return `{
-    let o${s} = ks * ${NC}u * plane + (y * 2u + ${s >> 1}u) * ow + x * 2u + ${s & 1}u;
+    let o${s} = (item * U.nks + ks) * ${NC}u * plane + (y * 2u + ${s >> 1}u) * ow + x * 2u + ${s & 1}u;
     ${lines.join(' ')}
   }`;
     })
@@ -461,20 +474,24 @@ struct EU { cin: u32, fw: u32, fh: u32, wOff: u32, bOff: u32, oOff: u32, pad1: u
   // align_corners=False) into the running state fm: flow (0-3) += up(tmp) * scale; mask (4) and
   // block features (5-12) are replaced.
   const accum = /* wgsl */ `
-struct AU { pw: u32, ph: u32, tw: u32, th: u32, scale: f32, first: u32, ks: u32, nc: u32 };
+struct AU { pw: u32, ph: u32, tw: u32, th: u32, scale: f32, first: u32, ks: u32, nc: u32, tmpStride: u32, fmStride: u32, pad0: u32, pad1: u32 };
 @group(0) @binding(0) var<uniform> U: AU;
 @group(0) @binding(1) var<storage, read> tmp: array<f32>;
 @group(0) @binding(2) var<storage, read_write> fm: array<f32>;
 
 // sum of the deconv's split-K slices
+var<private> tBase: u32; // this batch item's slices
+
 fn T(i: u32) -> f32 {
   var v = 0.0;
-  for (var s = 0u; s < U.ks; s++) { v += tmp[s * U.nc * U.tw * U.th + i]; }
+  for (var s = 0u; s < U.ks; s++) { v += tmp[tBase + s * U.nc * U.tw * U.th + i]; }
   return v;
 }
 
 @compute @workgroup_size(16, 16) fn main(@builtin(global_invocation_id) g: vec3u) {
   if (g.x >= U.pw || g.y >= U.ph) { return; }
+  tBase = g.z * U.tmpStride;
+  let fBase = g.z * U.fmStride;
   let src = max((vec2f(g.xy) + 0.5) / U.scale - 0.5, vec2f(0.0));
   let x0 = min(u32(floor(src.x)), U.tw - 1u);
   let y0 = min(u32(floor(src.y)), U.th - 1u);
@@ -491,9 +508,9 @@ fn T(i: u32) -> f32 {
     var v = mix(top, bot, a.y);
     if (c < 4u) {
       v *= U.scale;
-      if (U.first == 0u) { v += fm[c * mp + o]; }
+      if (U.first == 0u) { v += fm[fBase + c * mp + o]; }
     }
-    fm[c * mp + o] = v;
+    fm[fBase + c * mp + o] = v;
   }
 }
 `;
@@ -508,16 +525,17 @@ struct SK { n: u32, ks: u32, pad0: u32, pad1: u32 };
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) g: vec3u) {
   let i = g.x + g.y * 65535u * 256u;
   if (i >= U.n) { return; }
+  let base = g.z * U.ks * U.n; // (batch item)
   var v = 0.0;
-  for (var s = 0u; s < U.ks; s++) { v += tmp[s * U.n + i]; }
-  tmp[i] = v;
+  for (var s = 0u; s < U.ks; s++) { v += tmp[base + s * U.n + i]; }
+  tmp[base + i] = v;
 }
 `;
 
   // Final (flow, mask) of the picture area -> textures for the renderer, plus scene-change statistics:
   // the share of pixels whose two warped samples disagree (sampled on a 2x2 grid).
   const pack = /* wgsl */ `
-struct KU { cw: u32, ch: u32, pw: u32, ph: u32 };
+struct KU { cw: u32, ch: u32, pw: u32, ph: u32, fmOff: u32, pad0: u32, pad1: u32, pad2: u32 };
 @group(0) @binding(0) var<uniform> U: KU;
 @group(0) @binding(1) var<storage, read> fm: array<f32>;
 @group(0) @binding(2) var<storage, read> img0: array<f32>;
@@ -542,8 +560,9 @@ fn lumAt(buf: u32, p: vec2f) -> f32 {
   if (g.x < U.cw && g.y < U.ch) {
     let plane = U.pw * U.ph;
     let i = g.y * U.pw + g.x;
-    let f = vec4f(fm[i], fm[plane + i], fm[2u * plane + i], fm[3u * plane + i]);
-    let m = 1.0 / (1.0 + exp(-fm[4u * plane + i]));
+    let k = U.fmOff + i;
+    let f = vec4f(fm[k], fm[plane + k], fm[2u * plane + k], fm[3u * plane + k]);
+    let m = 1.0 / (1.0 + exp(-fm[4u * plane + k]));
     let size = vec2f(f32(U.cw), f32(U.ch));
     textureStore(flowOut, g.xy, vec4f(f.xy / size, f.zw / size));
     let p = vec2f(g.xy);

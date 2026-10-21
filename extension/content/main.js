@@ -8,7 +8,10 @@
   const audioByVideo = new WeakMap(); // a media element can be routed through WebAudio only once
   const PRESET_ORDER = ['fast', 'standard', 'quality'];
   const PRESET_NAMES = { fast: '速度優先', standard: '標準', quality: '高画質' };
-  const LOAD_LIMIT = 0.7; // share of GPU time interpolation may use before the guard steps in (gpuLimit 'auto')
+  // gpuLimit 'auto': share of GPU time interpolation may use before the guard steps in while frames
+  // are late (underruns), and regardless of them
+  const LOAD_LIMIT = 0.7;
+  const LOAD_LIMIT_SMOOTH = 0.9;
   const TAG = '[NuruNuru Frames AI]';
 
   class Player {
@@ -183,13 +186,15 @@
       return (p.me * rate + (p.render || 0) * this.outRate()) / 1000;
     }
 
-    // GPU load limit from the settings: 'auto' = LOAD_LIMIT, a percentage, or 'off' (only a GPU that
-    // finishes no inference at all makes the guard step in)
-    loadLimit() {
+    // GPU load limit from the settings: a percentage, 'off' (only a GPU that finishes no inference at
+    // all makes the guard step in) or 'auto' (LOAD_LIMIT while there were underruns in the last
+    // second, else LOAD_LIMIT_SMOOTH: a busy GPU that keeps up is left alone)
+    loadLimit(late) {
       const g = this.settings.gpuLimit;
       if (g === 'off') return Infinity;
       const v = +g;
-      return g === 'auto' || !(v >= 10 && v <= 200) ? LOAD_LIMIT : v / 100;
+      if (g !== 'auto' && v >= 10 && v <= 200) return v / 100;
+      return late ? LOAD_LIMIT : LOAD_LIMIT_SMOOTH;
     }
 
     // Called once per second while interpolating. After 3 s over the limit: drop the optional extra
@@ -212,7 +217,10 @@
       if (playing && wanted > 0) p.starve = finished === 0 ? p.starve + 1 : 0;
       const starving = p.starve >= 5;
       if (load == null && !starving) return;
-      p.over = starving || (load != null && load > this.loadLimit()) ? p.over + 1 : 0;
+      const under = this.clock.underruns;
+      const late = p.underruns != null && under - p.underruns >= 2;
+      p.underruns = under;
+      p.over = starving || (load != null && load > this.loadLimit(late)) ? p.over + 1 : 0;
       if (p.over < 3) return;
       p.over = 0;
       p.starve = 0;

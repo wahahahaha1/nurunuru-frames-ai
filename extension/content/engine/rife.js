@@ -217,6 +217,7 @@
       this.choice = new Map(); // 'layer key@size' -> index into CONV_VARIANTS (auto-tuner; shared with siblings)
       this.res = null;
       this.keyPrefix = '';
+      this.batch = 1; // inferences run together (items of every buffer one after another)
     }
 
     pipeFor(cfg) {
@@ -294,9 +295,9 @@
 
     // A second network sharing weights and pipelines, with its own size and scratch buffers
     // (step keys prefixed with `prefix` so their timings are kept apart).
-    sibling(prefix) {
+    sibling(prefix, batch = 1) {
       const n = Object.create(RifeNet.prototype);
-      Object.assign(n, this, { res: null, keyPrefix: prefix, parent: this });
+      Object.assign(n, this, { res: null, keyPrefix: prefix, parent: this, batch });
       return n;
     }
 
@@ -373,14 +374,15 @@
       notePart(this.head.convs[0], 2, hw, hh);
       notePart(this.head.convs[1], 1, hw, hh);
       const sbuf = (n, extra = 0) => d.createBuffer({ size: Math.max(16, n * 4), usage: BU.STORAGE | extra });
+      const B = this.batch;
       const bufs = {
-        x: sbuf(maxIn),
-        mid: sbuf(maxMid),
-        f0: sbuf(maxFeat),
-        f1: sbuf(maxFeat),
-        part: sbuf(maxPart),
-        tmp: sbuf(maxTmp),
-        fm: sbuf(NC * pw * ph, BU.COPY_SRC), // COPY_SRC: read back by tests
+        x: sbuf(B * maxIn),
+        mid: sbuf(B * maxMid),
+        f0: sbuf(B * maxFeat),
+        f1: sbuf(B * maxFeat),
+        part: sbuf(B * maxPart),
+        tmp: sbuf(B * maxTmp),
+        fm: sbuf(B * NC * pw * ph, BU.COPY_SRC), // COPY_SRC: read back by tests
         h0: sbuf(16 * hw * hh),
         h1: sbuf(16 * hw * hh),
       };
@@ -391,23 +393,24 @@
         });
       // Conv layer -> 1 step, or 2 with split-K (partial sums, then reduce + bias + residual + act).
       // (variant: index into CONV_VARIANTS; default: the auto-tuner's choice for this layer, else 0)
-      const convSteps = (key, block, L, stride, inBuf, iw, ih, outBuf, ow, oh, resBuf, variant) => {
+      // (nb: batch items; the Head runs one frame at a time)
+      const convSteps = (key, block, L, stride, inBuf, iw, ih, outBuf, ow, oh, resBuf, variant, nb = B) => {
         const base = convPlan(L, stride, ow, oh);
         const vi = variant != null ? variant : this.choice.get(`${key}@${ow}x${oh}`) || 0;
         const cfg = CONV_VARIANTS[base.key][vi];
         const c = vi === 0 ? base : { ...convPlan(L, stride, ow, oh, { conv1: cfg, conv1s: cfg, conv2: cfg }), key: base.key };
         const pipe = vi === 0 ? this.pipes[c.key] : this.pipeFor(cfg);
         const split = c.ks > 1;
-        const u = uni(new Uint32Array([L.cin, L.cout, iw, ih, ow, oh, L.wOff, L.bOff, resBuf ? 1 : 0, 1, c.ncog, c.cinPer, split ? 1 : 0, 0, 0, 0]));
+        const u = uni(new Uint32Array([L.cin, L.cout, iw, ih, ow, oh, L.wOff, L.bOff, resBuf ? 1 : 0, 1, c.ncog, c.cinPer, split ? 1 : 0, c.ks, 0, 0]));
         const kind = stride === 1 ? 'conv1' : 'conv2';
         const desc = `${c.key}${vi ? `/${vi}` : ''} ${L.cin}→${L.cout} ${ow}×${oh}${split ? ` k${c.ks}` : ''}`; // (for profiling)
         const layer = { L, stride, iw, ih, ow, oh }; // (for the benchmark's kernel sweep)
-        const conv = { key: this.keyPrefix + key, pipe, block, kind, variant: desc, layer, bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, split ? bufs.part : outBuf]), wg: c.wg, cost: L.cin * L.cout * 9 * ow * oh };
+        const conv = { key: this.keyPrefix + key, pipe, block, kind, variant: desc, layer, bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, split ? bufs.part : outBuf]), wg: [c.wg[0], c.wg[1], c.wg[2] * nb], cost: nb * L.cin * L.cout * 9 * ow * oh };
         if (!split) return [conv];
         const n = L.cout * ow * oh;
         const ru = uni(new Uint32Array([n, ow * oh, c.ks, resBuf ? 1 : 0, L.bOff, 1, 0, 0]));
         const red = this.pipes.reduce;
-        return [conv, { key: this.keyPrefix + key + 'r', pipe: red, block, kind, bg: bg(red, [ru, bufs.part, this.wbuf, resBuf || bufs.part, outBuf]), wg: [Math.ceil(n / 256), 1, 1], cost: n * c.ks }];
+        return [conv, { key: this.keyPrefix + key + 'r', pipe: red, block, kind, bg: bg(red, [ru, bufs.part, this.wbuf, resBuf || bufs.part, outBuf]), wg: [Math.ceil(n / 256), nb, 1], cost: nb * n * c.ks }];
       };
       const steps = []; // static steps (block inputs are filled per job)
       const convCalls = []; // arguments of the blocks' conv layers (for the auto-tuner)
@@ -429,15 +432,15 @@
         });
         const [fw, fh] = p.h2;
         const dp = deconvPlan(L.deconv.cin, fw, fh);
-        const du = uni(new Uint32Array([L.deconv.cin, fw, fh, L.deconv.wOff, L.deconv.bOff, dp.cinPer, 0, 0]));
+        const du = uni(new Uint32Array([L.deconv.cin, fw, fh, L.deconv.wOff, L.deconv.bOff, dp.cinPer, dp.ks, 0]));
         steps.push({
           key: `${this.keyPrefix}b${b}d`,
           pipe: this.pipes.deconv,
           block: b,
           kind: 'deconv',
           bg: bg(this.pipes.deconv, [du, cur, this.wbuf, bufs.tmp]),
-          wg: [Math.ceil(fw / 8), Math.ceil(fh / 8), 4 * dp.ks],
-          cost: L.deconv.cin * NC * fw * fh * 4,
+          wg: [Math.ceil(fw / 8), Math.ceil(fh / 8), 4 * dp.ks * B],
+          cost: B * L.deconv.cin * NC * fw * fh * 4,
           variant: `deconv ${L.deconv.cin}→${NC} ${fw * 4}×${fh * 4}${dp.ks > 1 ? ` k${dp.ks}` : ''}`,
         });
         if (dp.ks > 1) {
@@ -449,12 +452,12 @@
             block: b,
             kind: 'deconv',
             bg: bg(this.pipes.sumK, [uni(new Uint32Array([n, dp.ks, 0, 0])), bufs.tmp]),
-            wg: [Math.min(65535, Math.ceil(n / 256)), Math.ceil(n / 256 / 65535), 1],
-            cost: n * dp.ks,
+            wg: [Math.min(65535, Math.ceil(n / 256)), Math.ceil(n / 256 / 65535), B],
+            cost: B * n * dp.ks,
           });
         }
-        const abuf = new ArrayBuffer(32);
-        new Uint32Array(abuf).set([pw, ph, fw * 4, fh * 4, 0, b === 0 ? 1 : 0, 1, NC]);
+        const abuf = new ArrayBuffer(48);
+        new Uint32Array(abuf).set([pw, ph, fw * 4, fh * 4, 0, b === 0 ? 1 : 0, 1, NC, dp.ks * NC * fw * 4 * fh * 4, NC * pw * ph, 0, 0]);
         new Float32Array(abuf)[4] = p.scale;
         steps.push({
           key: `${this.keyPrefix}b${b}a`,
@@ -462,15 +465,15 @@
           block: b,
           kind: 'other',
           bg: bg(this.pipes.accum, [uni(abuf), bufs.tmp, bufs.fm]),
-          wg: [Math.ceil(pw / 16), Math.ceil(ph / 16), 1],
-          cost: pw * ph * NC * 4,
+          wg: [Math.ceil(pw / 16), Math.ceil(ph / 16), B],
+          cost: B * pw * ph * NC * 4,
         });
-        p.prepU = new Map(); // timestep -> uniform buffer (made on first use)
+        p.prepU = new Map(); // 'timestep/item' -> uniform buffer (made on first use)
         p.prepCost = p.bw * p.bh * (b === 0 ? 30 : 400);
       }
       this.res = {
         cw, ch, pw, ph, plan, bufs, steps, uniforms, bg, convSteps, convCalls, uni,
-        packU: uni(new Uint32Array([cw, ch, pw, ph])),
+        packU: [...Array(B).keys()].map((k) => uni(new Uint32Array([cw, ch, pw, ph, k * NC * pw * ph, 0, 0, 0]))),
         headCache: new Map(),
       };
     }
@@ -487,9 +490,9 @@
       const hh = ph / 2;
       const [c0, c1, c2] = this.head.convs;
       steps = [
-        ...r.convSteps('h0', -1, c0, 2, tensor, pw, ph, bufs.h0, hw, hh),
-        ...r.convSteps('h1', -1, c1, 1, bufs.h0, hw, hh, bufs.h1, hw, hh),
-        ...r.convSteps('h2', -1, c2, 1, bufs.h1, hw, hh, bufs.h0, hw, hh),
+        ...r.convSteps('h0', -1, c0, 2, tensor, pw, ph, bufs.h0, hw, hh, undefined, undefined, 1),
+        ...r.convSteps('h1', -1, c1, 1, bufs.h0, hw, hh, bufs.h1, hw, hh, undefined, undefined, 1),
+        ...r.convSteps('h2', -1, c2, 1, bufs.h1, hw, hh, bufs.h0, hw, hh, undefined, undefined, 1),
       ];
       const D = this.head.deconv;
       const eu = r.uni(new Uint32Array([D.cin, hw, hh, D.wOff, D.bOff, 3 * pw * ph, 0, 0]));
@@ -519,38 +522,50 @@
     }
 
     // Step list for the pair (tensors a -> b, Head features already computed) at timestep ts; the
-    // last step writes out's flow / mask textures and scene statistics.
+    // last step writes out's flow / mask textures and scene statistics. With batch > 1, `items` lists
+    // the pairs ({ a, b, out }) inferred together: job(items, ts).
     job(tensorA, tensorB, out, ts = 0.5) {
+      const items = Array.isArray(tensorA) ? tensorA : [{ a: tensorA, b: tensorB, out }];
+      if (Array.isArray(tensorA)) ts = tensorB != null ? tensorB : 0.5;
       const r = this.res;
-      const steps = r.steps.slice();
-      for (const p of r.plan) {
-        if (!p.prepU.has(ts)) {
-          const pb = new ArrayBuffer(32);
-          new Uint32Array(pb).set([r.pw, r.ph, p.bw, p.bh, 0, p.i === 0 ? 1 : 0, 0, 0]);
-          const f = new Float32Array(pb);
-          f[4] = p.scale;
-          f[6] = ts;
-          p.prepU.set(ts, r.uni(pb));
-        }
-        steps[p.prepIndex] = {
-          key: `${this.keyPrefix}b${p.i}p`,
-          pipe: this.pipes.prep,
-          block: p.i,
-          kind: 'other',
-          bg: r.bg(this.pipes.prep, [p.prepU.get(ts), tensorA, tensorB, r.bufs.fm, r.bufs.x]),
-          wg: [Math.ceil(p.bw / 16), Math.ceil(p.bh / 16), 1],
-          cost: p.prepCost,
-        };
-      }
-      steps.push({
-        key: this.keyPrefix + 'pack',
-        pipe: this.pipes.pack,
-        block: r.plan.length - 1,
-        kind: 'other',
-        bg: r.bg(this.pipes.pack, [r.packU, r.bufs.fm, tensorA, tensorB, out.flowView, out.maskView, out.stats]),
-        wg: [Math.ceil(r.cw / 16), Math.ceil(r.ch / 16), 1],
-        cost: r.cw * r.ch * 30,
+      const steps = [];
+      const prepAt = new Map(r.plan.map((p) => [p.prepIndex, p]));
+      r.steps.forEach((s, k) => {
+        if (s) return steps.push(s);
+        // block input of each item (its own frame tensors)
+        const p = prepAt.get(k);
+        items.forEach((it, n) => {
+          const key = `${ts}/${n}`;
+          if (!p.prepU.has(key)) {
+            const pb = new ArrayBuffer(48);
+            new Uint32Array(pb).set([r.pw, r.ph, p.bw, p.bh, 0, p.i === 0 ? 1 : 0, 0, 0, n * p.inC * p.bw * p.bh, n * NC * r.pw * r.ph, 0, 0]);
+            const f = new Float32Array(pb);
+            f[4] = p.scale;
+            f[6] = ts;
+            p.prepU.set(key, r.uni(pb));
+          }
+          steps.push({
+            key: `${this.keyPrefix}b${p.i}p`,
+            pipe: this.pipes.prep,
+            block: p.i,
+            kind: 'other',
+            bg: r.bg(this.pipes.prep, [p.prepU.get(key), it.a, it.b, r.bufs.fm, r.bufs.x]),
+            wg: [Math.ceil(p.bw / 16), Math.ceil(p.bh / 16), 1],
+            cost: p.prepCost,
+          });
+        });
       });
+      items.forEach((it, n) =>
+        steps.push({
+          key: this.keyPrefix + 'pack',
+          pipe: this.pipes.pack,
+          block: r.plan.length - 1,
+          kind: 'other',
+          bg: r.bg(this.pipes.pack, [r.packU[n], r.bufs.fm, it.a, it.b, it.out.flowView, it.out.maskView, it.out.stats]),
+          wg: [Math.ceil(r.cw / 16), Math.ceil(r.ch / 16), 1],
+          cost: r.cw * r.ch * 30,
+        })
+      );
       return steps;
     }
 

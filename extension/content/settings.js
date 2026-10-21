@@ -16,7 +16,7 @@
     ensemble4: false, // with ensemble: also on the mirrored pair both ways (4x inference in all, for fast GPUs)
     masking: 0, // 0..100: show the nearer original frame where no motion is trusted
     sceneSensitivity: 60, // 0..100: higher = scene changes detected more readily
-    gpuLimit: 'auto', // 'auto' (70 %) | 40..100 (%) | 'off': GPU load at which optional processing is turned off automatically
+    gpuLimit: 'auto', // 'auto' (70 % with underruns, else 90 %) | 40..100 (%) | 'off': GPU load at which optional processing is turned off automatically
     bufferMs: 0, // extra output delay (ms) that absorbs momentary slowdowns (more frames are kept on the GPU)
     audioSync: false, // delay audio by the interpolation latency (routes the video's audio through WebAudio)
     audioOffsetMs: 0, // extra audio delay (+) or advance (-)

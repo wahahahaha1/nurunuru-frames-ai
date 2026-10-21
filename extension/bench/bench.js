@@ -241,7 +241,9 @@
         if (preset === 'standard') {
           // optional parts at this preset
           const variants = [
+            ['（比較）推論をまとめない', { hybrid: true, multiscale: true, ensemble: true, batchEns: false }],
             ['＋ 左右反転でも推論（推論 4 回）', { hybrid: true, multiscale: true, ensemble: 4 }],
+            ['（比較）左右反転・推論をまとめない', { hybrid: true, multiscale: true, ensemble: 4, batchEns: false }],
             ['入れ替えての推論なし', { hybrid: true, multiscale: true, ensemble: false }],
             ['半分の解像度での推論なし', { hybrid: true, multiscale: false, ensemble: true }],
             ['ハイブリッドなし（RIFE のみ）', { hybrid: false }],
@@ -252,6 +254,7 @@
             const v = makeJob(device, net, { ...P, ...opt });
             const t = await timeJob(device, v.steps);
             obody.insertAdjacentHTML('beforeend', `<tr><td>${label}</td><td>${t.ms.toFixed(1)} ms</td>${loadCell(t.ms, 24)}${loadCell(t.ms, 30)}</tr>`);
+            log(`${label}: ${t.ms.toFixed(2)} ms, ${v.steps.length} dispatches`);
             v.eng.destroy();
           }
           $('options').hidden = false;

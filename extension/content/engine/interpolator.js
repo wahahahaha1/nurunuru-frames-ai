@@ -24,6 +24,8 @@
       // the ensemble's second run, with its own scratch so that the two runs' steps can be interleaved
       // (independent work the GPU can overlap: the low-resolution blocks alone leave it mostly idle)
       this.netS = net.sibling('S');
+      // the ensemble's runs inferred together as one batch (fewer, larger dispatches), when memory allows
+      this.netE = null;
       this.params = { ...S.TUNING, ...S.PRESETS.standard, ...params };
       const W = S.WGSL;
       const mod = (code, label) => device.createShaderModule({ code, label });
@@ -132,6 +134,7 @@
       this.destroyResources();
       this.netH.destroyResources();
       this.netS.destroyResources();
+      this.dropEnsNet();
       this.net.destroyResources(); // the previous model's scratch (reallocated if switched back)
       this.net = net;
       this.netH = net.sibling('H');
@@ -169,8 +172,8 @@
       this.net.configure(mw, mh);
       const half = S.RifeNet.modelSize(srcW, srcH, Math.round(mw / 2) / S.RifeNet.widthFactor(srcW, srcH), this.net.spec.modulo);
       this.netH.configure(half.cw, half.ch);
-      if (this.options().useEns) this.netS.configure(mw, mh);
-      else this.netS.destroyResources();
+      this.netS.destroyResources(); // (configured when first needed)
+      this.dropEnsNet();
       const uni = (data) => {
         const b = d.createBuffer({ size: Math.max(16, data.byteLength), usage: BU.UNIFORM | BU.COPY_DST });
         d.queue.writeBuffer(b, 0, data);
@@ -292,8 +295,8 @@
     }
 
     rebuildNets() {
-      for (const n of [this.net, this.netS, this.netH]) {
-        if (!n.res) continue;
+      for (const n of [this.net, this.netS, this.netH, this.netE]) {
+        if (!n || !n.res) continue;
         const { cw, ch } = n.res;
         n.destroyResources();
         n.configure(cw, ch);
@@ -324,6 +327,25 @@
       const useBM = this.params.hybrid !== false;
       const e = this.params.ensemble;
       return { useBM, useHalf: useBM && this.params.multiscale !== false, useAnchors: !!this.params.anchors, useEns: e === 4 ? 4 : e ? 2 : 0 };
+    }
+
+    // The network inferring the ensemble's `items` runs as one batch at the model size, or null where
+    // batching is off or its scratch buffers would exceed the device's limits.
+    ensNet(items) {
+      const r = this.res;
+      if (this.params.batchEns === false) return null;
+      const lim = this.device.limits;
+      const bytes = items * S.RifeNet.scratchBytes(r.pw, r.ph);
+      if (bytes > lim.maxStorageBufferBindingSize || bytes > lim.maxBufferSize) return null;
+      if (this.netE && this.netE.batch !== items) this.dropEnsNet();
+      if (!this.netE) this.netE = this.net.sibling('E' + items, items);
+      if (!this.netE.res) this.netE.configure(r.mw, r.mh);
+      return this.netE;
+    }
+
+    dropEnsNet() {
+      if (this.netE) this.netE.destroyResources();
+      this.netE = null;
     }
 
     // The mirrored tensor of a frame record (allocated on first use).
@@ -363,7 +385,22 @@
       const e = r.ens;
       const runs = [];
       if (useBM) runs.push(this.bm.steps(a, b));
-      if (useEns) {
+      const netE = useEns ? this.ensNet(useEns) : null;
+      if (netE) {
+        const items = [
+          { a: a.tensor, b: b.tensor, out: { flowView: e.flowNView, maskView: e.maskNView, stats } },
+          { a: b.tensor, b: a.tensor, out: { flowView: e.flowSView, maskView: e.maskSView, stats: r.scratchStats } },
+        ];
+        if (useEns === 4) {
+          const am = this.mirrored(a);
+          const bm = this.mirrored(b);
+          items.push(
+            { a: am, b: bm, out: { flowView: e.flowMView, maskView: e.maskMView, stats: r.scratchStats } },
+            { a: bm, b: am, out: { flowView: e.flowMSView, maskView: e.maskMSView, stats: r.scratchStats } }
+          );
+        }
+        runs.push(netE.job(items, 0.5));
+      } else if (useEns) {
         if (!this.netS.res) this.netS.configure(r.mw, r.mh);
         runs.push(this.net.job(a.tensor, b.tensor, { flowView: e.flowNView, maskView: e.maskNView, stats }));
         runs.push(this.netS.job(b.tensor, a.tensor, { flowView: e.flowSView, maskView: e.maskSView, stats: r.scratchStats }));
@@ -374,15 +411,15 @@
       steps.push(...interleave(runs));
       if (useEns) {
         const views = [e.flowNView, e.maskNView, e.flowSView, e.maskSView];
-        if (useEns === 4) {
+        if (useEns === 4 && !netE) {
           const am = this.mirrored(a);
           const bm = this.mirrored(b);
           steps.push(...interleave([
             this.net.job(am, bm, { flowView: e.flowMView, maskView: e.maskMView, stats: r.scratchStats }),
             this.netS.job(bm, am, { flowView: e.flowMSView, maskView: e.maskMSView, stats: r.scratchStats }),
           ]));
-          views.push(e.flowMView, e.maskMView, e.flowMSView, e.maskMSView);
         }
+        if (useEns === 4) views.push(e.flowMView, e.maskMView, e.flowMSView, e.maskMSView);
         const pipe = useEns === 4 ? this.combine4Pipe : this.combinePipe;
         steps.push({
           key: 'ens',
@@ -485,6 +522,7 @@
       this.destroyResources();
       this.netH.destroyResources();
       this.netS.destroyResources();
+      this.dropEnsNet();
       this.bm.destroy();
       this.renderU.destroy();
       this.zeroTex.destroy();
