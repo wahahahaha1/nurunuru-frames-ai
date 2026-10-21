@@ -42,7 +42,7 @@ struct IngestU { texel: vec2f, taps: f32, pad: f32 };
   // The tensor is pw x ph (the model's padded size); the picture fills the top-left cw x ch and the
   // rest is zero, like the zero padding of the reference implementation.
   const toTensor = /* wgsl */ `
-struct TU { cw: u32, ch: u32, pw: u32, ph: u32, taps: u32, pad0: u32, pad1: u32, pad2: u32 };
+struct TU { cw: u32, ch: u32, pw: u32, ph: u32, taps: u32, mirror: u32, pad1: u32, pad2: u32 };
 @group(0) @binding(0) var samp: sampler;
 @group(0) @binding(1) var img: texture_2d<f32>;
 @group(0) @binding(2) var<storage, read_write> outT: array<f32>;
@@ -52,7 +52,8 @@ struct TU { cw: u32, ch: u32, pw: u32, ph: u32, taps: u32, pad0: u32, pad1: u32,
   var s = vec3f(0.0);
   if (g.x < U.cw && g.y < U.ch) {
     let inv = vec2f(1.0 / f32(U.cw), 1.0 / f32(U.ch));
-    let base = vec2f(g.xy) * inv;
+    // (mirror: the picture flipped left-right, for the 4-way ensemble)
+    let base = vec2f(f32(select(g.x, U.cw - 1u - g.x, U.mirror == 1u)), f32(g.y)) * inv;
     let n = U.taps;
     for (var j = 0u; j < n; j++) {
       for (var i = 0u; i < n; i++) {
@@ -940,5 +941,33 @@ fn interp(p: vec2f, t: f32) -> vec3f {
 }
 `;
 
-  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, pack, select, selectPlain, render, combine };
+  // 4-way ensemble: also RIFE on the mirrored pair (A', B') and on (B', A'); their results are mirrored
+  // back (read at w - 1 - x, horizontal flow negated) before the four are averaged.
+  const combine4 = /* wgsl */ `
+@group(0) @binding(0) var flowN: texture_2d<f32>;
+@group(0) @binding(1) var maskN: texture_2d<f32>;
+@group(0) @binding(2) var flowS: texture_2d<f32>;
+@group(0) @binding(3) var maskS: texture_2d<f32>;
+@group(0) @binding(4) var flowM: texture_2d<f32>;
+@group(0) @binding(5) var maskM: texture_2d<f32>;
+@group(0) @binding(6) var flowMS: texture_2d<f32>;
+@group(0) @binding(7) var maskMS: texture_2d<f32>;
+@group(0) @binding(8) var flowOut: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(9) var maskOut: texture_storage_2d<rgba8unorm, write>;
+@compute @workgroup_size(16, 16) fn main(@builtin(global_invocation_id) g: vec3u) {
+  let size = textureDimensions(flowN);
+  if (g.x >= size.x || g.y >= size.y) { return; }
+  let q = vec2u(size.x - 1u - g.x, g.y);
+  let neg = vec4f(-1.0, 1.0, -1.0, 1.0);
+  let fs = textureLoad(flowS, g.xy, 0);
+  let fm = textureLoad(flowM, q, 0) * neg;
+  let fms = textureLoad(flowMS, q, 0) * neg;
+  let f = textureLoad(flowN, g.xy, 0) + vec4f(fs.zw, fs.xy) + fm + vec4f(fms.zw, fms.xy);
+  let m = textureLoad(maskN, g.xy, 0).r + 1.0 - textureLoad(maskS, g.xy, 0).r + textureLoad(maskM, q, 0).r + 1.0 - textureLoad(maskMS, q, 0).r;
+  textureStore(flowOut, g.xy, 0.25 * f);
+  textureStore(maskOut, g.xy, vec4f(0.25 * m, textureLoad(maskN, g.xy, 0).g, 0.0, 1.0));
+}
+`;
+
+  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, pack, select, selectPlain, render, combine, combine4 };
 })();

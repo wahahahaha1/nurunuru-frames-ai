@@ -35,6 +35,7 @@
       this.selectPipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.select, 'select'), entryPoint: 'main' } });
       this.selectPipePlain = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.selectPlain, 'select-plain'), entryPoint: 'main' } });
       this.combinePipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.combine, 'combine'), entryPoint: 'main' } });
+      this.combine4Pipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.combine4, 'combine4'), entryPoint: 'main' } });
       this.bm = new S.BlockMatcher(device, this.samp);
       this.renderMod = mod(W.render, 'render');
       this.renderPipes = new Map();
@@ -167,6 +168,7 @@
       const ingestScale = fw / srcW;
       const ingestU = uni(new Float32Array([1 / fw, 1 / fh, ingestScale < 0.75 ? 2 : 1, 0]));
       const tensorU = uni(new Uint32Array([mw, mh, pw, ph, Math.max(1, Math.min(4, Math.round(fw / mw))), 0, 0, 0]));
+      const tensorUM = uni(new Uint32Array([mw, mh, pw, ph, Math.max(1, Math.min(4, Math.round(fw / mw))), 1, 0, 0])); // mirrored
       const tensorUH = uni(new Uint32Array([half.cw, half.ch, half.pw, half.ph, Math.max(1, Math.min(4, Math.round(fw / half.cw))), 0, 0, 0]));
       const frames = [];
       for (let s = 0; s < RING; s++) {
@@ -186,6 +188,9 @@
           tensorH: d.createBuffer({ size: S.RifeNet.tensorSize(half.pw, half.ph) * 4, usage: BU.STORAGE }),
           flowH: d.createTexture({ size: [half.cw, half.ch], format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
           maskH: d.createTexture({ size: [half.cw, half.ch], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
+          tensorM: null, // mirrored tensor (4-way ensemble), allocated when first needed
+          featM: false, // Head features of the mirrored tensor are submitted
+          hasTensorM: false, // the mirrored tensor holds this frame
           featH: false, // Head features of the half-resolution tensor are submitted
           hasTensorH: false, // the half-resolution tensor holds this frame
           stats: d.createBuffer({ size: 16, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC }),
@@ -240,13 +245,13 @@
       const scratchStats = d.createBuffer({ size: 16, usage: BU.STORAGE });
       // ensemble: the two RIFE runs of a pair before they are combined into the pair's flow / mask
       const ens = {};
-      for (const k of ['N', 'S']) {
+      for (const k of ['N', 'S', 'M', 'MS']) {
         ens['flow' + k] = d.createTexture({ size: [mw, mh], format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING });
         ens['mask' + k] = d.createTexture({ size: [mw, mh], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING });
         ens['flow' + k + 'View'] = ens['flow' + k].createView();
         ens['mask' + k + 'View'] = ens['mask' + k].createView();
       }
-      this.res = { srcW, srcH, fw, fh, mw, mh, pw, ph, half, ingestU, tensorU, tensorUH, selectU, selectUH, scratchStats, ens, frames, next: 0, jobKeys: new Map() };
+      this.res = { srcW, srcH, fw, fh, mw, mh, pw, ph, half, ingestU, tensorU, tensorUM, tensorUH, selectU, selectUH, scratchStats, ens, frames, next: 0, jobKeys: new Map() };
       return true;
     }
 
@@ -256,7 +261,11 @@
       const o = this.options();
       const opt = `${o.useBM}/${o.useHalf}/${o.useAnchors}/${o.useEns}`;
       if (!r.jobKeys.has(opt)) {
-        const heads = [...this.net.headSteps(r.frames[0].tensor), ...(o.useHalf ? this.netH.headSteps(r.frames[0].tensorH) : [])];
+        const heads = [
+          ...this.net.headSteps(r.frames[0].tensor),
+          ...(o.useEns === 4 ? this.net.headSteps(this.mirrored(r.frames[0])) : []),
+          ...(o.useHalf ? this.netH.headSteps(r.frames[0].tensorH) : []),
+        ];
         const steps = [...heads, ...this.pairSteps(r.frames[0], r.frames[1], o)];
         r.jobKeys.set(opt, steps.map((st) => st.key));
       }
@@ -264,11 +273,30 @@
     }
 
     // Which parts a job runs with the current parameters: block matching (hybrid), half-resolution
-    // RIFE (multiscale, needs the hybrid's selection map), extra anchors, ensemble (RIFE also on the
-    // swapped pair).
+    // RIFE (multiscale, needs the hybrid's selection map), extra anchors, ensemble (useEns = 2: RIFE
+    // also on the swapped pair; 4: and on the mirrored pair both ways).
     options() {
       const useBM = this.params.hybrid !== false;
-      return { useBM, useHalf: useBM && this.params.multiscale !== false, useAnchors: !!this.params.anchors, useEns: !!this.params.ensemble };
+      const e = this.params.ensemble;
+      return { useBM, useHalf: useBM && this.params.multiscale !== false, useAnchors: !!this.params.anchors, useEns: e === 4 ? 4 : e ? 2 : 0 };
+    }
+
+    // The mirrored tensor of a frame record (allocated on first use).
+    mirrored(f) {
+      if (!f.tensorM) {
+        const r = this.res;
+        f.tensorM = this.device.createBuffer({ size: S.RifeNet.tensorSize(r.pw, r.ph) * 4, usage: BU.STORAGE });
+        f.tensorMBG = this.device.createBindGroup({
+          layout: this.tensorPipe.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.samp },
+            { binding: 1, resource: f.view },
+            { binding: 2, resource: { buffer: f.tensorM } },
+            { binding: 3, resource: { buffer: r.tensorUM } },
+          ],
+        });
+      }
+      return f.tensorM;
     }
 
     // Steps of the pair (a -> b) after the Head features: block matching, RIFE at t = 0.5 (full and
@@ -284,14 +312,23 @@
         const e = r.ens;
         steps.push(...this.net.job(a.tensor, b.tensor, { flowView: e.flowNView, maskView: e.maskNView, stats }));
         steps.push(...this.net.job(b.tensor, a.tensor, { flowView: e.flowSView, maskView: e.maskSView, stats: r.scratchStats }));
+        const views = [e.flowNView, e.maskNView, e.flowSView, e.maskSView];
+        if (useEns === 4) {
+          const am = this.mirrored(a);
+          const bm = this.mirrored(b);
+          steps.push(...this.net.job(am, bm, { flowView: e.flowMView, maskView: e.maskMView, stats: r.scratchStats }));
+          steps.push(...this.net.job(bm, am, { flowView: e.flowMSView, maskView: e.maskMSView, stats: r.scratchStats }));
+          views.push(e.flowMView, e.maskMView, e.flowMSView, e.maskMSView);
+        }
+        const pipe = useEns === 4 ? this.combine4Pipe : this.combinePipe;
         steps.push({
           key: 'ens',
-          pipe: this.combinePipe,
+          pipe,
           block: this.net.spec.scales.length - 1,
           kind: 'other',
           bg: this.device.createBindGroup({
-            layout: this.combinePipe.getBindGroupLayout(0),
-            entries: [e.flowNView, e.maskNView, e.flowSView, e.maskSView, b.flowView, b.maskView].map((v, i) => ({ binding: i, resource: v })),
+            layout: pipe.getBindGroupLayout(0),
+            entries: [...views, b.flowView, b.maskView].map((v, i) => ({ binding: i, resource: v })),
           }),
           wg: [Math.ceil(r.mw / 16), Math.ceil(r.mh / 16), 1],
           cost: r.mw * r.mh * 10,
@@ -347,6 +384,7 @@
     destroyResources() {
       if (!this.res) return;
       this.net.forgetHeads(this.res.frames.map((f) => f.tensor));
+      this.net.forgetHeads(this.res.frames.filter((f) => f.tensorM).map((f) => f.tensorM));
       this.netH.forgetHeads(this.res.frames.map((f) => f.tensorH));
       for (const f of this.res.frames) {
         f.tex.destroy();
@@ -355,6 +393,7 @@
         f.mask.destroy();
         f.sel.destroy();
         f.tensorH.destroy();
+        if (f.tensorM) f.tensorM.destroy();
         f.flowH.destroy();
         f.maskH.destroy();
         f.stats.destroy();
@@ -364,11 +403,12 @@
         }
       }
       this.res.scratchStats.destroy();
-      for (const k of ['flowN', 'maskN', 'flowS', 'maskS']) this.res.ens[k].destroy();
+      for (const k of ['flowN', 'maskN', 'flowS', 'maskS', 'flowM', 'maskM', 'flowMS', 'maskMS']) this.res.ens[k].destroy();
       this.bm.destroyResources();
       this.res.ingestU.destroy();
       this.res.tensorU.destroy();
       this.res.tensorUH.destroy();
+      this.res.tensorUM.destroy();
       this.res.selectUH.destroy();
       this.res.selectU.destroy();
       this.jobs = [];
@@ -435,6 +475,8 @@
       f.feat = false;
       f.featH = false;
       f.hasTensorH = this.options().useHalf;
+      f.hasTensorM = this.options().useEns === 4;
+      f.featM = false;
       f.sameAs = null;
       f.drawId = f.id; // id of the frame that first showed this drawing
       f.pairDrawId = -1;
@@ -451,6 +493,11 @@
       if (this.options().useHalf) {
         cp.setBindGroup(0, f.tensorHBG);
         cp.dispatchWorkgroups(Math.ceil(r.half.pw / 16), Math.ceil(r.half.ph / 16));
+      }
+      if (f.hasTensorM) {
+        this.mirrored(f);
+        cp.setBindGroup(0, f.tensorMBG);
+        cp.dispatchWorkgroups(Math.ceil(r.pw / 16), Math.ceil(r.ph / 16));
       }
       this.bm.encodeLuma(cp, f);
       if (test) this.bm.encodeDiff(cp, prev, f);
@@ -487,11 +534,16 @@
       const o = this.options();
       // (half resolution was switched on after one of the frames came in: its half tensor is stale)
       if (!job.a.hasTensorH || !job.b.hasTensorH) o.useHalf = false;
+      if (o.useEns === 4 && (!job.a.hasTensorM || !job.b.hasTensorM)) o.useEns = 2;
       this.demand++;
       for (const f of [job.a, job.b]) {
         if (!f.feat) {
           steps.push(...this.net.headSteps(f.tensor));
           job.marks.push([steps.length, f, 'feat']); // features of f are submitted once steps[0, n) are
+        }
+        if (o.useEns === 4 && !f.featM) {
+          steps.push(...this.net.headSteps(this.mirrored(f)));
+          job.marks.push([steps.length, f, 'featM']);
         }
         if (o.useHalf && !f.featH) {
           steps.push(...this.netH.headSteps(f.tensorH));
