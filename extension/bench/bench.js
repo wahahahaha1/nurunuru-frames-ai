@@ -311,7 +311,40 @@
       log('エラー: ' + e.message);
     }
     $('run').disabled = false;
+    $('csv').hidden = false;
+  }
+
+  // All tables and the log as one CSV file (section, columns...), with a BOM so that Excel reads UTF-8.
+  function saveCsv() {
+    const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
+    const lines = [[q('GPU'), q($('gpu').textContent)].join(',')];
+    const sections = [
+      ['result', 'プリセット'],
+      ['options', 'オプション'],
+      ['breakdown', '内訳'],
+      ['hot', '時間のかかっている処理'],
+      ['sweep', '組み方の比較'],
+    ];
+    for (const [id, name] of sections) {
+      const t = $(id);
+      if (!t || t.hidden) continue;
+      for (const tr of t.querySelectorAll('tr')) {
+        const cells = [...tr.children].map((c) => c.textContent.trim());
+        if (cells.some((c) => c)) lines.push([q(name), ...cells.map(q)].join(','));
+      }
+    }
+    if (!$('tune').hidden) lines.push([q('自動調整'), q($('tune').textContent)].join(','));
+    for (const l of $('log').textContent.split('\n')) if (l.trim()) lines.push([q('記録'), q(l)].join(','));
+    const blob = new Blob(['\ufeff' + lines.join('\r\n') + '\r\n'], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    a.download = `nnf-ai-bench-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.csv`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
   }
 
   $('run').onclick = run;
+  $('csv').onclick = saveCsv;
 })();

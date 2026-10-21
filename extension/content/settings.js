@@ -59,7 +59,7 @@
     anchors: !!s.anchors,
     multiscale: !!s.multiscale,
     ensemble: s.ensemble ? (s.ensemble4 ? 4 : true) : false,
-    autotune: true, // measure the conv tilings on this GPU (once per model and size)
+    autotune: false, // measure the conv tilings on this GPU (once per model and size); off: no gain in the job on an RTX 3080
     masking: s.masking / 100,
     sceneFrac: 0.6 - (0.5 * s.sceneSensitivity) / 100, // default 60 -> 0.3 (normal pairs stay below ~0.1, cuts mostly above 0.45)
   });
