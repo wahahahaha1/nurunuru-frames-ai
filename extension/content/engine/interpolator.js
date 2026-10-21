@@ -32,6 +32,7 @@
       });
       this.tensorPipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.toTensor, 'to-tensor'), entryPoint: 'main' } });
       this.selectPipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.select, 'select'), entryPoint: 'main' } });
+      this.combinePipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.combine, 'combine'), entryPoint: 'main' } });
       this.bm = new S.BlockMatcher(device, this.samp);
       this.renderMod = mod(W.render, 'render');
       this.renderPipes = new Map();
@@ -235,7 +236,15 @@
       this.jobs = [];
       this.stepMs = new Map();
       const scratchStats = d.createBuffer({ size: 16, usage: BU.STORAGE });
-      this.res = { srcW, srcH, fw, fh, mw, mh, pw, ph, half, ingestU, tensorU, tensorUH, selectU, selectUH, scratchStats, frames, next: 0, jobKeys: new Map() };
+      // ensemble: the two RIFE runs of a pair before they are combined into the pair's flow / mask
+      const ens = {};
+      for (const k of ['N', 'S']) {
+        ens['flow' + k] = d.createTexture({ size: [mw, mh], format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING });
+        ens['mask' + k] = d.createTexture({ size: [mw, mh], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING });
+        ens['flow' + k + 'View'] = ens['flow' + k].createView();
+        ens['mask' + k + 'View'] = ens['mask' + k].createView();
+      }
+      this.res = { srcW, srcH, fw, fh, mw, mh, pw, ph, half, ingestU, tensorU, tensorUH, selectU, selectUH, scratchStats, ens, frames, next: 0, jobKeys: new Map() };
       return true;
     }
 
@@ -243,7 +252,7 @@
     typicalKeys() {
       const r = this.res;
       const o = this.options();
-      const opt = `${o.useBM}/${o.useHalf}/${o.useAnchors}`;
+      const opt = `${o.useBM}/${o.useHalf}/${o.useAnchors}/${o.useEns}`;
       if (!r.jobKeys.has(opt)) {
         const heads = [...this.net.headSteps(r.frames[0].tensor), ...(o.useHalf ? this.netH.headSteps(r.frames[0].tensorH) : [])];
         const steps = [...heads, ...this.pairSteps(r.frames[0], r.frames[1], o)];
@@ -253,23 +262,43 @@
     }
 
     // Which parts a job runs with the current parameters: block matching (hybrid), half-resolution
-    // RIFE (multiscale, needs the hybrid's selection map), extra anchors.
+    // RIFE (multiscale, needs the hybrid's selection map), extra anchors, ensemble (RIFE also on the
+    // swapped pair).
     options() {
       const useBM = this.params.hybrid !== false;
-      return { useBM, useHalf: useBM && this.params.multiscale !== false, useAnchors: !!this.params.anchors };
+      return { useBM, useHalf: useBM && this.params.multiscale !== false, useAnchors: !!this.params.anchors, useEns: !!this.params.ensemble };
     }
 
     // Steps of the pair (a -> b) after the Head features: block matching, RIFE at t = 0.5 (full and
     // half resolution), selection map, then the extra anchor timesteps (each part if used).
     // steps.mainEnd = index after which the pair can be drawn.
-    pairSteps(a, b, { useBM, useHalf, useAnchors }) {
+    pairSteps(a, b, { useBM, useHalf, useAnchors, useEns }) {
       const steps = [];
+      const r = this.res;
       if (useBM) steps.push(...this.bm.steps(a, b));
       // with the selection map, scene statistics come from it (brightness-compensated)
-      steps.push(...this.net.job(a.tensor, b.tensor, useBM ? { flowView: b.flowView, maskView: b.maskView, stats: this.res.scratchStats } : b));
+      const stats = useBM ? r.scratchStats : b.stats;
+      if (useEns) {
+        const e = r.ens;
+        steps.push(...this.net.job(a.tensor, b.tensor, { flowView: e.flowNView, maskView: e.maskNView, stats }));
+        steps.push(...this.net.job(b.tensor, a.tensor, { flowView: e.flowSView, maskView: e.maskSView, stats: r.scratchStats }));
+        steps.push({
+          key: 'ens',
+          pipe: this.combinePipe,
+          block: this.net.spec.scales.length - 1,
+          kind: 'other',
+          bg: this.device.createBindGroup({
+            layout: this.combinePipe.getBindGroupLayout(0),
+            entries: [e.flowNView, e.maskNView, e.flowSView, e.maskSView, b.flowView, b.maskView].map((v, i) => ({ binding: i, resource: v })),
+          }),
+          wg: [Math.ceil(r.mw / 16), Math.ceil(r.mh / 16), 1],
+          cost: r.mw * r.mh * 10,
+        });
+      } else {
+        steps.push(...this.net.job(a.tensor, b.tensor, { flowView: b.flowView, maskView: b.maskView, stats }));
+      }
       if (useHalf) steps.push(...this.netH.job(a.tensorH, b.tensorH, { flowView: b.flowHView, maskView: b.maskHView, stats: this.res.scratchStats }));
       if (useBM) {
-        const r = this.res;
         steps.push({
           key: 'sel',
           pipe: this.selectPipe,
@@ -332,6 +361,7 @@
         }
       }
       this.res.scratchStats.destroy();
+      for (const k of ['flowN', 'maskN', 'flowS', 'maskS']) this.res.ens[k].destroy();
       this.bm.destroyResources();
       this.res.ingestU.destroy();
       this.res.tensorU.destroy();

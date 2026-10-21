@@ -899,5 +899,26 @@ fn interp(p: vec2f, t: f32) -> vec3f {
 }
 `;
 
-  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, pack, select, render };
+  // Ensemble: average of RIFE on (A, B) and on the swapped pair (B, A) (its two flows exchanged, its
+  // mask m -> 1 - m). RIFE's result depends on the order of its inputs; the average cancels part of it.
+  const combine = /* wgsl */ `
+@group(0) @binding(0) var flowN: texture_2d<f32>;
+@group(0) @binding(1) var maskN: texture_2d<f32>;
+@group(0) @binding(2) var flowS: texture_2d<f32>;
+@group(0) @binding(3) var maskS: texture_2d<f32>;
+@group(0) @binding(4) var flowOut: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(5) var maskOut: texture_storage_2d<rgba8unorm, write>;
+@compute @workgroup_size(16, 16) fn main(@builtin(global_invocation_id) g: vec3u) {
+  let size = textureDimensions(flowN);
+  if (g.x >= size.x || g.y >= size.y) { return; }
+  let fn0 = textureLoad(flowN, g.xy, 0);
+  let fs = textureLoad(flowS, g.xy, 0);
+  let mn = textureLoad(maskN, g.xy, 0);
+  let ms = textureLoad(maskS, g.xy, 0);
+  textureStore(flowOut, g.xy, 0.5 * (fn0 + vec4f(fs.zw, fs.xy)));
+  textureStore(maskOut, g.xy, vec4f(0.5 * (mn.r + 1.0 - ms.r), 0.5 * (mn.g + ms.g), 0.0, 1.0));
+}
+`;
+
+  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, pack, select, render, combine };
 })();

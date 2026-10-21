@@ -42,6 +42,8 @@
   <div class="hint">従来方式の動き推定も行い、そちらが前後のフレームをよく説明できる場所（パンや細かい模様）ではそちらを使います</div>
   <div class="row"><span>半分の解像度でも推論（大きな動き）</span><label class="switch"><input type="checkbox" id="multiscale"><span></span></label></div>
   <div class="hint">縮小した映像でも AI を動かし、速い動きをそちらのほうがよく捉える場所で使います（処理 約 1.3〜1.4 倍、ハイブリッドがオンのとき）。GPU が足りないときは自動でオフになります</div>
+  <div class="row"><span>入れ替えても推論して平均</span><label class="switch"><input type="checkbox" id="ensemble"><span></span></label></div>
+  <div class="hint">前後のフレームを入れ替えた組でも AI を動かし、2 つの結果を平均します。AI の推論の偏りが打ち消され、動きが正確になります（AI の推論 2 回）。GPU が足りないときは自動でオフになります</div>
   <div class="row"><span>大きな動きを高精度に（推論 3 回）</span><label class="switch"><input type="checkbox" id="anchors"><span></span></label></div>
   <div class="hint">2 枚の絵の中間だけでなく 1/4・3/4 の時刻でも AI を動かし、速い動きや急な拡大の崩れを減らします。GPU が足りないときは自動でオフになります</div>
   <div class="row"><span>アニメの作画に合わせる（2 コマ・3 コマ打ち）</span><label class="switch"><input type="checkbox" id="anime"><span></span></label></div>

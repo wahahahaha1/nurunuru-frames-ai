@@ -96,7 +96,7 @@
 
     applySettings(s) {
       const o = this.settings;
-      const engineChanged = ['preset', 'hybrid', 'multiscale', 'anchors'].some((k) => s[k] !== o[k]);
+      const engineChanged = ['preset', 'hybrid', 'multiscale', 'anchors', 'ensemble'].some((k) => s[k] !== o[k]);
       if (engineChanged || this.perf.stopped) {
         // the user changed something: forget automatic downgrades (and a stop) and try again
         if (this.perf.stopped) this.failed = null;
@@ -117,6 +117,7 @@
       const params = S.engineParams({ ...this.settings, preset: this.effectivePreset() });
       if (this.perf.noAnchors) params.anchors = false;
       if (this.perf.noHalf) params.multiscale = false;
+      if (this.perf.noEnsemble) params.ensemble = false;
       this.engine.setParams(params);
       if (this.engine.res !== old) this.flush();
       if (params.model !== this.engine.net.model && this.loadingModel !== params.model) {
@@ -175,7 +176,7 @@
     }
 
     // Called once per second while interpolating. After 3 s over the limit: drop the optional extra
-    // inferences (anchors, then half resolution), lower the preset, then halve the output frame rate,
+    // inferences (anchors, ensemble, half resolution), lower the preset, then halve the output frame rate,
     // then give up (show the original video). No finished inference for 5 s (a GPU too slow to even
     // report its timing) counts as over the limit.
     checkPerf() {
@@ -204,6 +205,11 @@
         p.noAnchors = true;
         p.me = null;
         p.note = 'GPU 負荷が高いため「大きな動きを高精度に」を自動でオフにしました';
+        this.applyEngineParams();
+      } else if (this.engine.params.ensemble && !p.noEnsemble) {
+        p.noEnsemble = true;
+        p.me = null;
+        p.note = 'GPU 負荷が高いため「入れ替えても推論して平均」を自動でオフにしました';
         this.applyEngineParams();
       } else if (this.engine.params.multiscale !== false && this.engine.params.hybrid !== false && !p.noHalf) {
         p.noHalf = true;
