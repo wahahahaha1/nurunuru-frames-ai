@@ -20,7 +20,7 @@
   const CONV_CFG = {
     conv1: { stride: 1, tx: 16, ty: 8, px: 2, py: 2, ci: 4 },
     conv1s: { stride: 1, tx: 8, ty: 8, px: 1, py: 1, ci: 8 }, // small feature maps (coarse blocks)
-    conv2: { stride: 2, tx: 8, ty: 8, px: 2, py: 2, ci: 2 },
+    conv2: { stride: 2, tx: 16, ty: 8, px: 2, py: 1, ci: 2, co: 32 }, // fastest of the benchmark's sweep on an RTX 3080
   };
   // Workgroups a dispatch should offer to fill a large GPU; small layers get split-K below this.
   const TARGET_WG = 512;
@@ -336,7 +336,7 @@
           block: b,
           kind: 'deconv',
           bg: bg(this.pipes.deconv, [du, cur, this.wbuf, bufs.tmp]),
-          wg: [Math.ceil((fw * 4) / 16), Math.ceil((fh * 4) / 16), dp.ks],
+          wg: [Math.ceil(fw / 8), Math.ceil(fh / 8), 4 * dp.ks],
           cost: L.deconv.cin * NC * fw * fh * 4,
           variant: `deconv ${L.deconv.cin}→${NC} ${fw * 4}×${fh * 4}${dp.ks > 1 ? ` k${dp.ks}` : ''}`,
         });

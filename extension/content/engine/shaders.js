@@ -325,11 +325,17 @@ struct RU { n: u32, plane: u32, ks: u32, res: u32, bOff: u32, leaky: u32, pad0: 
   // ConvTranspose2d(cin, 4 * NC, 4, stride 2, padding 1) + PixelShuffle(2) -> NC channels at 4x the
   // feature resolution (IFBlock.lastconv: flow 4, mask 1, features 8). Weights: for (ci, sub, ky, kx)
   // NV = ceil(NC / 4) vec4 holding output channels c * 4 + sub; bias: NV vec4 per sub.
-  // Split-K: dispatch z = ks covers input channels [ks * cinPer, ...) and writes slice ks of the
-  // output (bias in slice 0 only); accum adds the slices.
+  // A thread computes one position (x, y) of the transposed convolution (2fw x 2fh) for all 4 subs
+  // (= its 2x2 output pixels after the pixel shuffle) and all NC channels. A workgroup covers one
+  // parity class of (x, y), so all its threads use the same 2x2 taps and weights; those are staged in
+  // shared memory, CH input channels at a time.
+  // Split-K: dispatch z = parity + 4 * ks covers input channels [ks * cinPer, ...) and writes slice ks
+  // of the output (bias in slice 0 only); the slices are summed afterwards.
   function deconv(NC) {
     const NV = Math.ceil(NC / 4);
-    const vs = [...Array(NV).keys()];
+    const CH = 8;
+    const accs = [];
+    for (let s = 0; s < 4; s++) for (let v = 0; v < NV; v++) accs.push([s, v]);
     return /* wgsl */ `
 struct DU { cin: u32, fw: u32, fh: u32, wOff: u32, bOff: u32, cinPer: u32, pad1: u32, pad2: u32 };
 @group(0) @binding(0) var<uniform> U: DU;
@@ -337,43 +343,75 @@ struct DU { cin: u32, fw: u32, fh: u32, wOff: u32, bOff: u32, cinPer: u32, pad1:
 @group(0) @binding(2) var<storage, read> wts: array<vec4f>;
 @group(0) @binding(3) var<storage, read_write> outT: array<f32>;
 
-@compute @workgroup_size(16, 16) fn main(@builtin(global_invocation_id) g: vec3u) {
-  let ow = U.fw * 4u;
-  let oh = U.fh * 4u;
-  if (g.x >= ow || g.y >= oh) { return; }
-  let x = g.x >> 1u;
-  let y = g.y >> 1u;
-  let sub = (g.y & 1u) * 2u + (g.x & 1u);
-  // taps: y = 2 * iy - 1 + ky
-  let my = i32(y >> 1u);
-  let mx = i32(x >> 1u);
-  var iy = array<i32, 2>(my, my - 1);
+// weights of CH channels for this parity class: [cc][tap j * 2 + i][sub][v]
+var<workgroup> sW: array<vec4f, ${CH * 16 * NV}>;
+
+@compute @workgroup_size(8, 8) fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u, @builtin(local_invocation_index) tid: u32) {
+  let par = wg.z % 4u;
+  let ks = wg.z / 4u; // workgroup-uniform (the loop below contains barriers)
+  let px = par & 1u;
+  let py = par >> 1u;
+  let m = wg.x * 8u + lid.x; // feature column / row of this position
+  let n = wg.y * 8u + lid.y;
+  let inside = m < U.fw && n < U.fh;
+  // taps (as in the per-pixel form): y = 2 * iy - 1 + ky
+  var iy = array<i32, 2>(i32(n), i32(n) - 1);
   var ky = array<u32, 2>(1u, 3u);
-  if ((y & 1u) == 1u) { iy = array<i32, 2>(my, my + 1); ky = array<u32, 2>(2u, 0u); }
-  var ix = array<i32, 2>(mx, mx - 1);
+  if (py == 1u) { iy = array<i32, 2>(i32(n), i32(n) + 1); ky = array<u32, 2>(2u, 0u); }
+  var ix = array<i32, 2>(i32(m), i32(m) - 1);
   var kx = array<u32, 2>(1u, 3u);
-  if ((x & 1u) == 1u) { ix = array<i32, 2>(mx, mx + 1); kx = array<u32, 2>(2u, 0u); }
-  let ks = g.z;
-  ${vs.map((v) => `var acc${v} = vec4f(0.0);`).join(' ')}
+  if (px == 1u) { ix = array<i32, 2>(i32(m), i32(m) + 1); kx = array<u32, 2>(2u, 0u); }
+  ${accs.map(([s, v]) => `var a${s}_${v} = vec4f(0.0);`).join(' ')}
   if (ks == 0u) {
-    ${vs.map((v) => `acc${v} = wts[U.bOff + sub * ${NV}u + ${v}u];`).join(' ')}
+    ${accs.map(([s, v]) => `a${s}_${v} = wts[U.bOff + ${s * NV + v}u];`).join(' ')}
   }
-  let cEnd = min(U.cin, (ks + 1u) * U.cinPer);
-  for (var c = ks * U.cinPer; c < cEnd; c++) {
-    let wc = U.wOff + (c * 4u + sub) * ${16 * NV}u;
-    for (var j = 0; j < 2; j++) {
-      if (iy[j] < 0 || iy[j] >= i32(U.fh)) { continue; }
-      for (var i = 0; i < 2; i++) {
-        if (ix[i] < 0 || ix[i] >= i32(U.fw)) { continue; }
-        let v = feat[(c * U.fh + u32(iy[j])) * U.fw + u32(ix[i])];
-        let wi = wc + (ky[j] * 4u + kx[i]) * ${NV}u;
-        ${vs.map((v) => `acc${v} += v * wts[wi + ${v}u];`).join(' ')}
+  let cBeg = ks * U.cinPer;
+  let cEnd = min(U.cin, cBeg + U.cinPer);
+  for (var c0 = cBeg; c0 < cEnd; c0 += ${CH}u) {
+    workgroupBarrier();
+    for (var k = tid; k < ${CH * 16 * NV}u; k += 64u) {
+      let cc = k / ${16 * NV}u;
+      let r = k % ${16 * NV}u;
+      let tap = r / ${4 * NV}u;
+      let sub = (r / ${NV}u) % 4u;
+      let v = r % ${NV}u;
+      let c = c0 + cc;
+      var w = vec4f(0.0);
+      if (c < cEnd) { w = wts[U.wOff + (c * 4u + sub) * ${16 * NV}u + (ky[tap >> 1u] * 4u + kx[tap & 1u]) * ${NV}u + v]; }
+      sW[k] = w;
+    }
+    workgroupBarrier();
+    if (inside) {
+      for (var cc = 0u; cc < ${CH}u; cc++) {
+        let c = c0 + cc;
+        if (c >= cEnd) { break; }
+        for (var j = 0u; j < 2u; j++) {
+          if (iy[j] < 0 || iy[j] >= i32(U.fh)) { continue; }
+          for (var i = 0u; i < 2u; i++) {
+            if (ix[i] < 0 || ix[i] >= i32(U.fw)) { continue; }
+            let f = feat[(c * U.fh + u32(iy[j])) * U.fw + u32(ix[i])];
+            let wb = (cc * 4u + j * 2u + i) * ${4 * NV}u;
+            ${accs.map(([s, v]) => `a${s}_${v} += f * sW[wb + ${s * NV + v}u];`).join(' ')}
+          }
+        }
       }
     }
   }
-  let plane = ow * oh;
-  let o = ks * ${NC}u * plane + g.y * ow + g.x;
-  ${[...Array(NC).keys()].map((c) => `outT[o + ${c}u * plane] = acc${c >> 2}[${c & 3}];`).join('\n  ')}
+  if (!inside) { return; }
+  let ow = U.fw * 4u;
+  let plane = ow * U.fh * 4u;
+  let x = m * 2u + px; // position in the transposed convolution's output
+  let y = n * 2u + py;
+  ${[0, 1, 2, 3]
+    .map((s) => {
+      const lines = [];
+      for (let c = 0; c < NC; c++) lines.push(`outT[o${s} + ${c}u * plane] = a${s}_${c >> 2}[${c & 3}];`);
+      return `{
+    let o${s} = ks * ${NC}u * plane + (y * 2u + ${s >> 1}u) * ow + x * 2u + ${s & 1}u;
+    ${lines.join(' ')}
+  }`;
+    })
+    .join('\n  ')}
 }
 `;
   }
