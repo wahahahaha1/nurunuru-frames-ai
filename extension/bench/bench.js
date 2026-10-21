@@ -182,6 +182,14 @@
             log(`standard: sum of single-step passes ${total.toFixed(2)} ms`);
             $('breakdown').hidden = false;
             $('bdTitle').hidden = false;
+            // the slowest steps, with the multiply-adds per second they achieve (where known)
+            const hot = j.steps.map((s, i) => ({ s, ms: per[i] })).sort((x, y) => y.ms - x.ms).slice(0, 15);
+            $('hot').querySelector('tbody').innerHTML = hot
+              .map(({ s, ms }) => `<tr><td>${s.key}</td><td>${s.variant || KIND[s.kind]}</td><td>${ms.toFixed(2)} ms</td><td>${s.variant ? ((2 * s.cost) / ms / 1e9).toFixed(2) + ' TFLOPS' : ''}</td></tr>`)
+              .join('');
+            $('hot').hidden = false;
+            $('hotTitle').hidden = false;
+            log('hot: ' + hot.map(({ s, ms }) => `${s.key}=${ms.toFixed(2)}`).join(' '));
           }
         }
         j.eng.destroy();

@@ -451,6 +451,22 @@ fn T(i: u32) -> f32 {
 }
 `;
 
+  // Sum of the deconv's split-K slices, into slice 0 (in place: each element is read and written by
+  // its own thread only). Done once at the block's resolution, so that accum (which upsamples to the
+  // full picture, 4 taps x 13 channels per pixel) reads one slice instead of all of them.
+  const sumK = /* wgsl */ `
+struct SK { n: u32, ks: u32, pad0: u32, pad1: u32 };
+@group(0) @binding(0) var<uniform> U: SK;
+@group(0) @binding(1) var<storage, read_write> tmp: array<f32>;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) g: vec3u) {
+  let i = g.x + g.y * 65535u * 256u;
+  if (i >= U.n) { return; }
+  var v = 0.0;
+  for (var s = 0u; s < U.ks; s++) { v += tmp[s * U.n + i]; }
+  tmp[i] = v;
+}
+`;
+
   // Final (flow, mask) of the picture area -> textures for the renderer, plus scene-change statistics:
   // the share of pixels whose two warped samples disagree (sampled on a 2x2 grid).
   const pack = /* wgsl */ `
@@ -970,5 +986,5 @@ fn interp(p: vec2f, t: f32) -> vec3f {
 }
 `;
 
-  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, pack, select, selectPlain, selectEns4, render, combine, combine4 };
+  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, sumK, pack, select, selectPlain, selectEns4, render, combine, combine4 };
 })();

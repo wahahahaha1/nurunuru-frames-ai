@@ -191,6 +191,7 @@
         deconv: comp(W.deconv(NC), 'rife-deconv'),
         deconvPlain: comp(W.deconvPlain, 'rife-deconv-plain'),
         accum: comp(W.accum, 'rife-accum'),
+        sumK: comp(W.sumK, 'rife-sum-k'),
         pack: comp(W.pack, 'rife-pack'),
       };
       const { head, blocks, data } = packWeights(weights.tensors, spec.scales.length);
@@ -303,7 +304,8 @@
         const split = c.ks > 1;
         const u = uni(new Uint32Array([L.cin, L.cout, iw, ih, ow, oh, L.wOff, L.bOff, resBuf ? 1 : 0, 1, c.ncog, c.cinPer, split ? 1 : 0, 0, 0, 0]));
         const kind = stride === 1 ? 'conv1' : 'conv2';
-        const conv = { key: this.keyPrefix + key, pipe, block, kind, bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, split ? bufs.part : outBuf]), wg: c.wg, cost: L.cin * L.cout * 9 * ow * oh };
+        const variant = `${c.key} ${L.cin}→${L.cout} ${ow}×${oh}${split ? ` k${c.ks}` : ''}`; // (for profiling)
+        const conv = { key: this.keyPrefix + key, pipe, block, kind, variant, bg: bg(pipe, [u, inBuf, this.wbuf, resBuf || inBuf, split ? bufs.part : outBuf]), wg: c.wg, cost: L.cin * L.cout * 9 * ow * oh };
         if (!split) return [conv];
         const n = L.cout * ow * oh;
         const ru = uni(new Uint32Array([n, ow * oh, c.ks, resBuf ? 1 : 0, L.bOff, 1, 0, 0]));
@@ -334,9 +336,23 @@
           bg: bg(this.pipes.deconv, [du, cur, this.wbuf, bufs.tmp]),
           wg: [Math.ceil((fw * 4) / 16), Math.ceil((fh * 4) / 16), dp.ks],
           cost: L.deconv.cin * NC * fw * fh * 4,
+          variant: `deconv ${L.deconv.cin}→${NC} ${fw * 4}×${fh * 4}${dp.ks > 1 ? ` k${dp.ks}` : ''}`,
         });
+        if (dp.ks > 1) {
+          // split-K slices summed once here, not per full-resolution pixel in accum
+          const n = NC * fw * 4 * fh * 4;
+          steps.push({
+            key: `${this.keyPrefix}b${b}k`,
+            pipe: this.pipes.sumK,
+            block: b,
+            kind: 'deconv',
+            bg: bg(this.pipes.sumK, [uni(new Uint32Array([n, dp.ks, 0, 0])), bufs.tmp]),
+            wg: [Math.min(65535, Math.ceil(n / 256)), Math.ceil(n / 256 / 65535), 1],
+            cost: n * dp.ks,
+          });
+        }
         const abuf = new ArrayBuffer(32);
-        new Uint32Array(abuf).set([pw, ph, fw * 4, fh * 4, 0, b === 0 ? 1 : 0, dp.ks, NC]);
+        new Uint32Array(abuf).set([pw, ph, fw * 4, fh * 4, 0, b === 0 ? 1 : 0, 1, NC]);
         new Float32Array(abuf)[4] = p.scale;
         steps.push({
           key: `${this.keyPrefix}b${b}a`,
@@ -345,7 +361,7 @@
           kind: 'other',
           bg: bg(this.pipes.accum, [uni(abuf), bufs.tmp, bufs.fm]),
           wg: [Math.ceil(pw / 16), Math.ceil(ph / 16), 1],
-          cost: pw * ph * NC * 4 * dp.ks,
+          cost: pw * ph * NC * 4,
         });
         p.prepU = new Map(); // timestep -> uniform buffer (made on first use)
         p.prepCost = p.bw * p.bh * (b === 0 ? 30 : 400);
