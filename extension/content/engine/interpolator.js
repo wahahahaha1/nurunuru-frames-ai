@@ -14,6 +14,7 @@
   // Extra RIFE timesteps per pair (besides 0.5): output frames are drawn from the nearest one, so
   // large motion is extrapolated over a quarter of the pair at most instead of half of it.
   const ANCHORS = [0.25, 0.75];
+  const TUNE_VERSION = 2; // version of the auto-tuner's set of tilings
 
   class Interpolator {
     constructor(device, net, params) {
@@ -272,7 +273,8 @@
       const r = this.res;
       const net = this.net;
       const info = this.device.adapterInfo || {};
-      const key = [info.vendor, info.architecture, info.device, info.description, net.model, `${r.mw}x${r.mh}`, `${r.half.cw}x${r.half.ch}`].join('|');
+      // (TUNE_VERSION: bumped when the tilings tried change, so that older results are measured again)
+      const key = [TUNE_VERSION, info.vendor, info.architecture, info.device, info.description, net.model, `${r.mw}x${r.mh}`, `${r.half.cw}x${r.half.ch}`].join('|');
       if (this.tuneKey === key) return;
       this.tuneKey = key;
       const current = () => this.tuneKey === key && this.res && this.net === net;

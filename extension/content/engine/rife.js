@@ -29,6 +29,8 @@
     conv1s: [CONV_CFG.conv1s, { stride: 1, tx: 8, ty: 8, px: 1, py: 1, ci: 4, co: 32 }, CONV_CFG.conv1],
     conv2: [CONV_CFG.conv2, { stride: 2, tx: 8, ty: 8, px: 2, py: 2, ci: 2 }, { stride: 2, tx: 8, ty: 8, px: 2, py: 2, ci: 2, co: 32 }],
   };
+  // each also without split-K (appended, so stored indices keep their meaning)
+  for (const k of Object.keys(CONV_VARIANTS)) CONV_VARIANTS[k] = [...CONV_VARIANTS[k], ...CONV_VARIANTS[k].map((c) => ({ ...c, nosplit: true }))];
   // shared memory of a tiling (input tile + weights)
   const smemBytes = (c) =>
     4 * (c.ci * ((c.tx * c.px - 1) * c.stride + 3) * ((c.ty * c.py - 1) * c.stride + 3) + ((c.co || 16) / 16) * c.ci * 36 * 4);
@@ -44,7 +46,8 @@
     const cfg = cfgs[key];
     const ncog = groups(cfg);
     const wgs = tiles(cfg) * ncog;
-    let ks = Math.max(1, Math.min(8, Math.floor(L.cin / (cfg.ci * 4)), Math.ceil(TARGET_WG / wgs)));
+    // (nosplit: a variant of the auto-tuner; on some GPUs the split costs more than it gains)
+    let ks = cfg.nosplit ? 1 : Math.max(1, Math.min(8, Math.floor(L.cin / (cfg.ci * 4)), Math.ceil(TARGET_WG / wgs)));
     const cinPer = Math.ceil(L.cin / ks / cfg.ci) * cfg.ci;
     ks = Math.ceil(L.cin / cinPer);
     const wg = [Math.ceil(ow / (cfg.tx * cfg.px)), Math.ceil(oh / (cfg.ty * cfg.py)), ncog * ks];
@@ -217,10 +220,11 @@
     }
 
     pipeFor(cfg) {
-      const k = JSON.stringify(cfg);
+      const { nosplit, ...shader } = cfg; // (nosplit only changes the dispatch)
+      const k = JSON.stringify(shader);
       let p = this.convPipes.get(k);
       if (!p) {
-        p = this.device.createComputePipeline({ layout: 'auto', compute: { module: this.device.createShaderModule({ code: S.WGSL.conv(cfg) }), entryPoint: 'main' } });
+        p = this.device.createComputePipeline({ layout: 'auto', compute: { module: this.device.createShaderModule({ code: S.WGSL.conv(shader) }), entryPoint: 'main' } });
         this.convPipes.set(k, p);
       }
       return p;
