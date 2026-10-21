@@ -353,6 +353,7 @@
       }
       if (reason) {
         this.audio.set(0);
+        this.audioHeld = null;
         this.updateOSD(ts);
         return;
       }
@@ -421,7 +422,20 @@
       if (paired && sel.t > 0) this.stats.interp++;
       if (s.audioSync) {
         this.audio.enable();
-        this.audio.set(c.delay / Math.max(0.1, v.playbackRate) + s.audioOffsetMs / 1000);
+        // follow increases of the video delay, but decreases only once they have lasted 3 s (the
+        // delay steps up and down with the drawing cadence and the inference split; each audio
+        // delay change has to glide slowly to stay inaudible)
+        const want = c.delay / Math.max(0.1, v.playbackRate) + s.audioOffsetMs / 1000;
+        if (this.audioHeld == null || want >= this.audioHeld) {
+          this.audioHeld = want;
+          this.audioLowSince = null;
+        } else if (this.audioLowSince == null) {
+          this.audioLowSince = ts;
+        } else if (ts - this.audioLowSince > 3000) {
+          this.audioHeld = want;
+          this.audioLowSince = null;
+        }
+        this.audio.set(this.audioHeld);
       }
       this.updateOSD(ts);
     }
@@ -460,11 +474,8 @@
         chunks: this.engine ? this.engine.chunks : 0,
         delayMs: c.delay * 1000,
         audio: this.settings.audioSync ? this.audio.state : 'off',
-        // audio is delayed by the same video delay (+ user offset) once the WebAudio route is active
-        audioDelayMs:
-          this.settings.audioSync && this.audio.active && !this.reason
-            ? (c.delay / Math.max(0.1, v.playbackRate)) * 1000 + this.settings.audioOffsetMs
-            : 0,
+        // audio delay being applied (the video delay + user offset, held and glided) once the WebAudio route is active
+        audioDelayMs: this.settings.audioSync && this.audio.active && !this.reason && this.audioHeld != null ? this.audioHeld * 1000 : 0,
         underruns: c.underruns,
         drops: c.drops,
         errors: this.errors,

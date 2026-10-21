@@ -20,6 +20,9 @@
       this.device = device;
       this.net = net;
       this.netH = net.sibling('H'); // the same RIFE at half the resolution (large motion)
+      // the ensemble's second run, with its own scratch so that the two runs' steps can be interleaved
+      // (independent work the GPU can overlap: the low-resolution blocks alone leave it mostly idle)
+      this.netS = net.sibling('S');
       this.params = { ...S.TUNING, ...S.PRESETS.standard, ...params };
       const W = S.WGSL;
       const mod = (code, label) => device.createShaderModule({ code, label });
@@ -126,9 +129,11 @@
       const src = this.res && [this.res.srcW, this.res.srcH];
       this.destroyResources();
       this.netH.destroyResources();
+      this.netS.destroyResources();
       this.net.destroyResources(); // the previous model's scratch (reallocated if switched back)
       this.net = net;
       this.netH = net.sibling('H');
+      this.netS = net.sibling('S');
       if (src) this.configure(...src);
     }
 
@@ -161,6 +166,8 @@
       this.net.configure(mw, mh);
       const half = S.RifeNet.modelSize(srcW, srcH, Math.round(mw / 2) / S.RifeNet.widthFactor(srcW, srcH), this.net.spec.modulo);
       this.netH.configure(half.cw, half.ch);
+      if (this.options().useEns) this.netS.configure(mw, mh);
+      else this.netS.destroyResources();
       const uni = (data) => {
         const b = d.createBuffer({ size: Math.max(16, data.byteLength), usage: BU.UNIFORM | BU.COPY_DST });
         d.queue.writeBuffer(b, 0, data);
@@ -306,19 +313,37 @@
     pairSteps(a, b, { useBM, useHalf, useAnchors, useEns }) {
       const steps = [];
       const r = this.res;
-      if (useBM) steps.push(...this.bm.steps(a, b));
       // with the selection map, scene statistics come from it (brightness-compensated)
       const stats = useBM ? r.scratchStats : b.stats;
+      // Independent runs (block matching, the RIFE runs of the ensemble and at half resolution, each
+      // with its own scratch) are interleaved step by step so that the GPU can overlap them (the
+      // low-resolution blocks alone leave it mostly idle).
+      const interleave = (runs) => {
+        const out = [];
+        for (let k = 0; k < Math.max(...runs.map((x) => x.length)); k++) for (const x of runs) if (k < x.length) out.push(x[k]);
+        return out;
+      };
+      const e = r.ens;
+      const runs = [];
+      if (useBM) runs.push(this.bm.steps(a, b));
       if (useEns) {
-        const e = r.ens;
-        steps.push(...this.net.job(a.tensor, b.tensor, { flowView: e.flowNView, maskView: e.maskNView, stats }));
-        steps.push(...this.net.job(b.tensor, a.tensor, { flowView: e.flowSView, maskView: e.maskSView, stats: r.scratchStats }));
+        if (!this.netS.res) this.netS.configure(r.mw, r.mh);
+        runs.push(this.net.job(a.tensor, b.tensor, { flowView: e.flowNView, maskView: e.maskNView, stats }));
+        runs.push(this.netS.job(b.tensor, a.tensor, { flowView: e.flowSView, maskView: e.maskSView, stats: r.scratchStats }));
+      } else {
+        runs.push(this.net.job(a.tensor, b.tensor, { flowView: b.flowView, maskView: b.maskView, stats }));
+      }
+      if (useHalf) runs.push(this.netH.job(a.tensorH, b.tensorH, { flowView: b.flowHView, maskView: b.maskHView, stats: r.scratchStats }));
+      steps.push(...interleave(runs));
+      if (useEns) {
         const views = [e.flowNView, e.maskNView, e.flowSView, e.maskSView];
         if (useEns === 4) {
           const am = this.mirrored(a);
           const bm = this.mirrored(b);
-          steps.push(...this.net.job(am, bm, { flowView: e.flowMView, maskView: e.maskMView, stats: r.scratchStats }));
-          steps.push(...this.net.job(bm, am, { flowView: e.flowMSView, maskView: e.maskMSView, stats: r.scratchStats }));
+          steps.push(...interleave([
+            this.net.job(am, bm, { flowView: e.flowMView, maskView: e.maskMView, stats: r.scratchStats }),
+            this.netS.job(bm, am, { flowView: e.flowMSView, maskView: e.maskMSView, stats: r.scratchStats }),
+          ]));
           views.push(e.flowMView, e.maskMView, e.flowMSView, e.maskMSView);
         }
         const pipe = useEns === 4 ? this.combine4Pipe : this.combinePipe;
@@ -334,10 +359,7 @@
           wg: [Math.ceil(r.mw / 16), Math.ceil(r.mh / 16), 1],
           cost: r.mw * r.mh * 10,
         });
-      } else {
-        steps.push(...this.net.job(a.tensor, b.tensor, { flowView: b.flowView, maskView: b.maskView, stats }));
       }
-      if (useHalf) steps.push(...this.netH.job(a.tensorH, b.tensorH, { flowView: b.flowHView, maskView: b.maskHView, stats: this.res.scratchStats }));
       if (useBM) {
         const pipe = useEns === 4 ? this.selectPipeEns4 : useEns ? this.selectPipe : this.selectPipePlain;
         steps.push({
@@ -419,6 +441,7 @@
     destroy() {
       this.destroyResources();
       this.netH.destroyResources();
+      this.netS.destroyResources();
       this.bm.destroy();
       this.renderU.destroy();
       this.zeroTex.destroy();

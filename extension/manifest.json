@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "NuruNuru Frames AI",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "YouTube とニコニコ動画を WebGPU 上の AI（RIFE）でフレーム補間し、ディスプレイのリフレッシュレートで再生します。",
   "minimum_chrome_version": "116",
   "permissions": ["storage"],

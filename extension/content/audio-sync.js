@@ -3,6 +3,9 @@
 // is confirmed running (after a user gesture); otherwise the element is left untouched.
 (() => {
   const S = (globalThis.NNF = globalThis.NNF || {});
+  // A changing delay plays the audio faster (shrinking) or slower (growing) while it changes: limit
+  // the change to 2.5 % of real time (under half a semitone of pitch), so it cannot be heard.
+  const MAX_RATE = 0.025;
 
   class AudioDelay {
     constructor(video) {
@@ -56,13 +59,20 @@
       }
     }
 
-    // Delay in seconds (wall clock). The AudioContext's own processing latency is subtracted.
+    // Delay in seconds (wall clock). The AudioContext's own processing latency is subtracted. The
+    // delay glides to the new value at MAX_RATE.
     set(sec) {
       const extra = this.ctx ? this.ctx.baseLatency || 0 : 0;
       const v = Math.max(0, Math.min(0.9, sec - extra));
       if (Math.abs(v - this.target) < 0.002) return;
       this.target = v;
-      if (this.delayNode) this.delayNode.delayTime.setTargetAtTime(v, this.ctx.currentTime, 0.05);
+      if (!this.delayNode) return;
+      const p = this.delayNode.delayTime;
+      const now = this.ctx.currentTime;
+      const cur = p.value;
+      p.cancelScheduledValues(now);
+      p.setValueAtTime(cur, now);
+      p.linearRampToValueAtTime(v, now + Math.max(0.05, Math.abs(v - cur) / MAX_RATE));
     }
 
     get active() {
