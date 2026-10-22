@@ -1,3 +1,14 @@
 __pycache__/
 *.pkl
 *.zip
+# videos and frame dumps are never part of the repository
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.avi
+*.rgb
+*.u8
+*.f32
+*.png
+!extension/icons/*.png
