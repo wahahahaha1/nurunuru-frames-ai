@@ -2,11 +2,11 @@
 
 This project includes model weights and a port of the model architecture from the following projects.
 
-## Practical-RIFE (RIFE v4.6 architecture and weights)
+## Practical-RIFE (RIFE v4.25 / v4.25 lite architecture and weights)
 
 https://github.com/hzwer/Practical-RIFE
 
-`extension/models/rife-v4.6.bin` contains the RIFE v4.6 weights converted to fp16, and `extension/content/engine/rife.js` / `shaders.js` reimplement the IFNet architecture.
+`extension/models/rife-v4.25.bin` and `extension/models/rife-v4.25-lite.bin` contain the RIFE v4.25 and v4.25 lite weights converted to fp16, and `extension/content/engine/rife.js` / `shaders.js` reimplement the IFNet architecture.
 
 ```
 MIT License
@@ -32,7 +32,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## vs-rife (distribution of the v4.6 checkpoint used for conversion)
+## vs-rife (distribution of the v4.25 / v4.25 lite checkpoints used for conversion)
 
 https://github.com/HolyWu/vs-rife
 
