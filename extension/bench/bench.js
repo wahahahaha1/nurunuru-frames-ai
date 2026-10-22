@@ -78,7 +78,14 @@
   const median = (a) => [...a].sort((x, y) => x - y)[a.length >> 1];
 
   async function timeJob(device, steps) {
-    await timeGroups(device, [steps]); // warm-up (pipeline compilation, caches)
+    // warm-up (pipeline compilation, caches, GPU clocks ramping up): until a run is no faster than
+    // the one before (a heavy preset run first otherwise reads up to 1.7x slow), at most 10 runs
+    let last = Infinity;
+    for (let i = 0; i < 10; i++) {
+      const ms = (await timeGroups(device, [steps]))[0];
+      if (ms > 0.97 * last) break;
+      last = ms;
+    }
     const times = [];
     for (let i = 0; i < RUNS; i++) times.push((await timeGroups(device, [steps]))[0]);
     return { ms: median(times), times };
