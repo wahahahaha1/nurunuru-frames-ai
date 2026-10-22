@@ -9,6 +9,7 @@
   const BU = GPUBufferUsage;
   const TU = GPUTextureUsage;
   const CHUNK_SHARE = 0.45; // share of a display frame one inference chunk should take
+  const STATS_BYTES = 48; // per-pair statistics: scene change (0-1), directing effects (2-8)
   const MAX_INFLIGHT = 2; // inference submissions the GPU may lag behind before pump() waits
   const MEASURE_EVERY = 8; // every n-th inference job is timed step by step
   // Extra RIFE timesteps per pair (besides 0.5): output frames are drawn from the nearest one, so
@@ -43,12 +44,17 @@
       this.selectPipeEns4 = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.selectEns4, 'select-ens4'), entryPoint: 'main' } });
       this.combinePipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.combine, 'combine'), entryPoint: 'main' } });
       this.combine4Pipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.combine4, 'combine4'), entryPoint: 'main' } });
+      // directing effects (sudden large motion, shake, flash): statistics and decision per pair
+      this.fxStatsPipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.fxStats, 'fx-stats'), entryPoint: 'main' } });
+      this.fxDecidePipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod(W.fxDecide, 'fx-decide'), entryPoint: 'main' } });
+      this.fxCounts = [0, 0, 0]; // pairs shown as drawn for each effect (with fxMask set)
+      this.fxReadbacks = [];
       this.bm = new S.BlockMatcher(device, this.samp);
       this.renderMod = mod(W.render, 'render');
       this.renderPipes = new Map();
       this.renderU = device.createBuffer({ size: 64, usage: BU.UNIFORM | BU.COPY_DST });
       this.zeroTex = device.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: TU.TEXTURE_BINDING });
-      this.zeroStats = device.createBuffer({ size: 16, usage: BU.STORAGE });
+      this.zeroStats = device.createBuffer({ size: STATS_BYTES, usage: BU.STORAGE });
       this.res = null;
       this.seq = 0;
       this.jobs = [];
@@ -207,7 +213,9 @@
           hasTensorM: false, // the mirrored tensor holds this frame
           featH: false, // Head features of the half-resolution tensor are submitted
           hasTensorH: false, // the half-resolution tensor holds this frame
-          stats: d.createBuffer({ size: 16, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC }),
+          stats: d.createBuffer({ size: STATS_BYTES, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC }),
+          fxU: d.createBuffer({ size: 16, usage: BU.UNIFORM | BU.COPY_DST }),
+          fxDU: d.createBuffer({ size: 16, usage: BU.UNIFORM | BU.COPY_DST }),
           id: -1, // sequence number of the frame currently held
           hasPair: false, // RIFE result for (id-1 -> id) is complete
           hasSel: false, // ... together with block matching and the selection map
@@ -464,6 +472,7 @@
           cost: r.mw * r.mh * 300,
         });
       }
+      steps.push(...this.fxSteps(a, b, useHalf));
       steps.mainEnd = steps.length;
       if (useAnchors) {
         for (const an of b.anchors) {
@@ -484,6 +493,38 @@
       return steps;
     }
 
+    // Directing-effect statistics and decision of the pair (a -> b), into b.stats (after its flow is
+    // final). Thresholds from params.fxSensitivity (0..100, higher = detected more readily).
+    fxSteps(a, b, useHalf) {
+      const d = this.device;
+      const r = this.res;
+      const k = Math.pow(2, (50 - (this.params.fxSensitivity ?? 50)) / 50);
+      d.queue.writeBuffer(b.fxU, 0, new Float32Array([r.mw, r.mh, useHalf ? 1 : 0, 0.05 * k]));
+      d.queue.writeBuffer(b.fxDU, 0, new Float32Array([0.06 * k, 1 + 1.5 * k, 0.012 * k, 0.3 * k]));
+      const bg = (pipe, res) => d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: res.map((x, i) => ({ binding: i, resource: x instanceof GPUBuffer ? { buffer: x } : x })) });
+      return [
+        {
+          key: 'fx',
+          pipe: this.fxStatsPipe,
+          block: -2,
+          kind: 'other',
+          bg: bg(this.fxStatsPipe, [b.fxU, this.samp, a.view, b.view, b.flowView, useHalf ? b.flowHView : b.flowView, b.stats]),
+          wg: [Math.ceil(r.mw / 32), Math.ceil(r.mh / 32), 1],
+          cost: r.mw * r.mh * 4,
+        },
+        {
+          key: 'fxd',
+          pipe: this.fxDecidePipe,
+          block: -2,
+          kind: 'other',
+          // (the previous pair's statistics are a's, valid if a's pair was inferred: decided on the GPU)
+          bg: bg(this.fxDecidePipe, [b.fxDU, a === b ? this.zeroStats : a.stats, b.stats, a.bm.mean, b.bm.mean]),
+          wg: [1, 1, 1],
+          cost: 1000,
+        },
+      ];
+    }
+
     destroyResources() {
       if (!this.res) return;
       this.net.forgetHeads(this.res.frames.map((f) => f.tensor));
@@ -500,6 +541,8 @@
         f.flowH.destroy();
         f.maskH.destroy();
         f.stats.destroy();
+        f.fxU.destroy();
+        f.fxDU.destroy();
         for (const an of f.anchors) {
           if (an.flow) an.flow.destroy();
           if (an.mask) an.mask.destroy();
@@ -527,6 +570,7 @@
       this.renderU.destroy();
       this.zeroTex.destroy();
       this.zeroStats.destroy();
+      for (const b of this.fxReadbacks) b.destroy();
       this.onTiming = null;
       if (this.timing) {
         this.querySet.destroy();
@@ -762,6 +806,7 @@
       job.next = last;
       for (const [n, f, flag] of job.marks) if (last >= n) f[flag] = true;
       let read = null;
+      let fxRead = null; // the pair's directing-effect decision, read back for the player's statistics
       if (timed) {
         const size = 16 * (last - first);
         const resolve = d.createBuffer({ size, usage: BU.QUERY_RESOLVE | BU.COPY_SRC });
@@ -779,6 +824,8 @@
         job.b.pairPrevId = job.aId;
         job.b.pairDrawId = job.a.drawId;
         this.done++;
+        if (this.params.fxMask) fxRead = this.fxReadbacks.pop() || d.createBuffer({ size: STATS_BYTES, usage: BU.COPY_DST | BU.MAP_READ });
+        if (fxRead) enc.copyBufferToBuffer(job.b.stats, 0, fxRead, 0, STATS_BYTES);
       }
       if (last === steps.length) this.jobs.shift();
       d.queue.submit([enc.finish()]);
@@ -786,6 +833,18 @@
         if (--job.pending === 0 && job.next === steps.length && job.ms) this.noteJobTimes(steps, job.ms);
       };
       if (job.ms) job.pending++;
+      if (fxRead) {
+        fxRead.mapAsync(GPUMapMode.READ).then(
+          () => {
+            const flags = new Uint32Array(fxRead.getMappedRange())[7];
+            fxRead.unmap();
+            for (let i = 0; i < 3; i++) if (flags & this.params.fxMask & (1 << i)) this.fxCounts[i]++;
+            if (this.fxReadbacks.length < 4) this.fxReadbacks.push(fxRead);
+            else fxRead.destroy();
+          },
+          () => fxRead.destroy()
+        );
+      }
       if (read) {
         read.mapAsync(GPUMapMode.READ).then(
           () => {
@@ -866,6 +925,7 @@
       f[10] = opts.split || 0;
       f[11] = sel ? (opts.hybrid ?? 1) : -1;
       f[12] = anchor ? anchor.ts : 0.5;
+      u[13] = p.fxMask || 0;
       d.queue.writeBuffer(this.renderU, 0, buf);
       const pipe = this.renderPipe(format);
       const zero = this.zeroTex.createView();

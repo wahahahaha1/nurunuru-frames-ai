@@ -6,6 +6,7 @@
   const fmt = {
     masking: (v) => `${v}`,
     sceneSensitivity: (v) => `${v}`,
+    fxSensitivity: (v) => `${v}`,
     audioOffsetMs: (v) => `${v > 0 ? '+' : ''}${v} ms`,
   };
 
@@ -43,11 +44,11 @@
     renderTargetHint();
     for (const el of document.querySelectorAll('[data-site]')) el.checked = settings.sites[el.dataset.site] !== false;
     for (const b of $('preset').children) b.classList.toggle('sel', b.dataset.v === settings.preset);
-    for (const id of ['masking', 'sceneSensitivity', 'audioOffsetMs']) {
+    for (const id of ['masking', 'sceneSensitivity', 'fxSensitivity', 'audioOffsetMs']) {
       $(id).value = settings[id];
       $(id + 'Out').textContent = fmt[id](settings[id]);
     }
-    for (const id of ['hybrid', 'multiscale', 'ensemble', 'ensemble4', 'anchors', 'anime', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).checked = settings[id];
+    for (const id of ['hybrid', 'multiscale', 'ensemble', 'ensemble4', 'anchors', 'anime', 'fxMotion', 'fxShake', 'fxFlash', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).checked = settings[id];
   }
 
   function save(patch) {
@@ -65,11 +66,11 @@
   $('gpuLimit').onchange = (e) => save({ gpuLimit: /^\d+$/.test(e.target.value) ? +e.target.value : e.target.value });
   $('bufferMs').onchange = (e) => save({ bufferMs: +e.target.value });
   $('targetFps').onchange = (e) => save({ targetFps: Math.max(24, Math.min(500, Math.round(+e.target.value || 60))) });
-  for (const id of ['masking', 'sceneSensitivity', 'audioOffsetMs']) {
+  for (const id of ['masking', 'sceneSensitivity', 'fxSensitivity', 'audioOffsetMs']) {
     $(id).oninput = (e) => ($(id + 'Out').textContent = fmt[id](+e.target.value));
     $(id).onchange = (e) => save({ [id]: +e.target.value });
   }
-  for (const id of ['hybrid', 'multiscale', 'ensemble', 'ensemble4', 'anchors', 'anime', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).onchange = (e) => save({ [id]: e.target.checked });
+  for (const id of ['hybrid', 'multiscale', 'ensemble', 'ensemble4', 'anchors', 'anime', 'fxMotion', 'fxShake', 'fxFlash', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).onchange = (e) => save({ [id]: e.target.checked });
 
   $('capture').onclick = async () => {
     try {

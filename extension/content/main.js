@@ -492,6 +492,8 @@
         // audio delay being applied (the video delay + user offset, held and glided) once the WebAudio route is active
         audioDelayMs: this.settings.audioSync && this.audio.active && !this.reason ? this.audio.delay * 1000 : 0,
         underruns: c.underruns,
+        // pairs shown as drawn as a directing effect (sudden motion, shake, flash), with that effect enabled
+        fxCounts: this.engine && this.engine.params.fxMask ? this.engine.fxCounts.slice() : null,
         drops: c.drops,
         errors: this.errors,
         lastError: this.lastError || '',
@@ -516,6 +518,7 @@
         `${st.src} ${st.srcFps.toFixed(2)}fps → ${st.outFps.toFixed(0)}fps (目標 ${st.targetFps.toFixed(0)} / 補間 ${st.interpPct.toFixed(0)}%)\n` +
         `RIFE ${st.me} (${st.chunks} 分割) | 映像遅延 ${st.delayMs.toFixed(0)}ms | 音ズレ補正 ${audioText} | GPU ${gpu}\n` +
         `underrun ${st.underruns} | drop ${st.drops} | err ${st.errors}` +
+        (st.fxCounts ? ` | 演出で補間なし 動き ${st.fxCounts[0]}・揺れ ${st.fxCounts[1]}・光 ${st.fxCounts[2]}` : '') +
         (st.perfNote ? `\n${st.perfNote}` : '')
       );
     }

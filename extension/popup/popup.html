@@ -57,6 +57,19 @@
 </section>
 
 <section>
+  <div class="label">演出を優先（補間しない場面）</div>
+  <div class="hint">急な変化そのものが見せ方になっている場面は、なめらかにすると勢いが弱まります。検出した場面は補間せず、元の動画のタイミングのまま表示します（場面全体で切り替え）。速い動きをなめらかに見たい動画（ゲーム、スポーツ）ではオフのままにしてください</div>
+  <div class="row"><span>一瞬の大きな動き（ツメ・スミア・瞬間移動）</span><label class="switch"><input type="checkbox" id="fxMotion"><span></span></label></div>
+  <div class="hint">前の組より急に大きく動いた場面と、その動きが続く間。一定の速さのパンは対象外</div>
+  <div class="row"><span>画面の揺れ（衝撃・地震）</span><label class="switch"><input type="checkbox" id="fxShake"><span></span></label></div>
+  <div class="hint">画面全体の動きが組ごとに向きを変える場面</div>
+  <div class="row"><span>フラッシュ・光の演出</span><label class="switch"><input type="checkbox" id="fxFlash"><span></span></label></div>
+  <div class="hint">明るさが急に変わる場面（ゆっくりしたフェードは対象外）</div>
+  <div class="label">検出の感度 <output id="fxSensitivityOut"></output></div>
+  <input type="range" id="fxSensitivity" min="0" max="100" step="5">
+</section>
+
+<section>
   <div class="label">GPU 負荷の上限</div>
   <div class="target">
     <select id="gpuLimit">

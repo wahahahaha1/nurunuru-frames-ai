@@ -826,6 +826,89 @@ ${bmInterp}
   // With block matching (hybrid > 0) its result replaces RIFE's where the selection map says so.
   // Masking: where neither motion is trusted, fall back towards the nearer original frame (no ghosting).
   // mode: 0 interpolate, 1 frame A, 2 frame B, 3 plain blend, 4 flow visualisation, 5 selection map
+
+  // Directing effects that interpolation would weaken (the pair is then shown as drawn). Statistics
+  // of the pair's motion into stats[2..6] (a sample every 2 px; per sample the RIFE result, full or
+  // half resolution, whose two warps agree better; motion in picture widths, fixed point / 1024):
+  //   2 samples, 3 samples moving more than U.big, 4-5 summed motion (i32 bits), 6 summed |motion|
+  const fxStats = /* wgsl */ `
+struct FU { size: vec2f, useHalf: f32, big: f32 };
+@group(0) @binding(0) var<uniform> U: FU;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var texA: texture_2d<f32>;
+@group(0) @binding(3) var texB: texture_2d<f32>;
+@group(0) @binding(4) var flowT: texture_2d<f32>;
+@group(0) @binding(5) var flowH: texture_2d<f32>;
+@group(0) @binding(6) var<storage, read_write> stats: array<atomic<u32>, 12>;
+var<workgroup> acc: array<atomic<u32>, 5>;
+
+fn lum(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
+fn err(p: vec2f, f: vec4f) -> f32 {
+  return abs(lum(textureSampleLevel(texA, samp, p + f.xy, 0.0).rgb) - lum(textureSampleLevel(texB, samp, p + f.zw, 0.0).rgb));
+}
+
+@compute @workgroup_size(16, 16) fn main(@builtin(global_invocation_id) g: vec3u, @builtin(local_invocation_index) tid: u32) {
+  if (tid < 5u) { atomicStore(&acc[tid], 0u); }
+  workgroupBarrier();
+  let px = vec2f(g.xy) * 2.0 + 1.0;
+  if (px.x < U.size.x && px.y < U.size.y) {
+    let p = px / U.size;
+    var f = textureSampleLevel(flowT, samp, p, 0.0);
+    if (U.useHalf > 0.0) {
+      let h = textureSampleLevel(flowH, samp, p, 0.0);
+      if (err(p, h) < err(p, f)) { f = h; }
+    }
+    let v = (f.zw - f.xy) * vec2f(1.0, U.size.y / U.size.x);
+    let m = length(v);
+    atomicAdd(&acc[0], 1u);
+    if (m > U.big) { atomicAdd(&acc[1], 1u); }
+    atomicAdd(&acc[2], bitcast<u32>(i32(round(v.x * 1024.0))));
+    atomicAdd(&acc[3], bitcast<u32>(i32(round(v.y * 1024.0))));
+    atomicAdd(&acc[4], u32(round(m * 1024.0)));
+  }
+  workgroupBarrier();
+  if (tid < 5u) { atomicAdd(&stats[2u + tid], atomicLoad(&acc[tid])); }
+}
+`;
+
+  // Decision (one thread), against the previous pair's statistics (prev; none if its stats[2] is 0):
+  // stats[7] bits 1 sudden large motion (much larger than the previous pair's, or continuing one),
+  // 2 shake (the whole picture's motion reverses), 4 flash (sudden brightness change, or its
+  // reversal); stats[8] = log brightness ratio of the pair (f32 bits).
+  const fxDecide = /* wgsl */ `
+struct DU { share: f32, ratio: f32, shake: f32, flash: f32 };
+@group(0) @binding(0) var<uniform> U: DU;
+@group(0) @binding(1) var<storage, read> prev: array<u32, 12>;
+@group(0) @binding(2) var<storage, read_write> cur: array<u32, 12>;
+@group(0) @binding(3) var<storage, read> meanA: array<u32, 2>;
+@group(0) @binding(4) var<storage, read> meanB: array<u32, 2>;
+
+@compute @workgroup_size(1) fn main() {
+  let n = f32(cur[2]);
+  if (n == 0.0) { return; }
+  let ma = f32(meanA[0]) / max(f32(meanA[1]), 1.0);
+  let mb = f32(meanB[0]) / max(f32(meanB[1]), 1.0);
+  let r = log((mb + 1.0) / (ma + 1.0)); // (sums are luma * 256)
+  cur[8] = bitcast<u32>(r);
+  let pv = prev[2] > 0u;
+  let pflags = select(0u, prev[7], pv);
+  var flags = 0u;
+  let mag = f32(cur[6]) / (1024.0 * n);
+  if (pv && f32(cur[3]) > U.share * n) {
+    let pmag = f32(prev[6]) / (1024.0 * f32(prev[2]));
+    if (mag > U.ratio * pmag + 0.005 || (pflags & 1u) != 0u) { flags |= 1u; }
+  }
+  let g = vec2f(f32(bitcast<i32>(cur[4])), f32(bitcast<i32>(cur[5]))) / (1024.0 * n);
+  if (pv && length(g) > U.shake) {
+    let pg = vec2f(f32(bitcast<i32>(prev[4])), f32(bitcast<i32>(prev[5]))) / (1024.0 * f32(prev[2]));
+    if (length(pg) > 0.5 * U.shake && dot(g, pg) < -0.5 * length(g) * length(pg)) { flags |= 2u; }
+  }
+  let pr = select(0.0, bitcast<f32>(prev[8]), pv);
+  if (abs(r) > U.flash && (abs(pr) < 0.5 * U.flash || ((pflags & 4u) != 0u && r * pr < 0.0))) { flags |= 4u; }
+  cur[7] = flags;
+}
+`;
+
   const render = fullscreenVS + /* wgsl */ `
 struct RU {
   rect: vec4f,
@@ -837,7 +920,7 @@ struct RU {
   split: f32,
   hybrid: f32, // weight of block matching where selected; < 0: no block matching / selection map
   tau: f32, // timestep of the extra RIFE anchor bound as flowX / maskX (0.5 = none)
-  pad0: f32,
+  fxMask: u32, // directing effects (stats[7] bits) shown as drawn
   pad1: f32,
   pad2: f32,
 };
@@ -847,7 +930,7 @@ struct RU {
 @group(0) @binding(3) var texB: texture_2d<f32>;
 @group(0) @binding(4) var flowT: texture_2d<f32>;
 @group(0) @binding(5) var maskT: texture_2d<f32>;
-@group(0) @binding(6) var<storage, read> stats: array<u32, 4>;
+@group(0) @binding(6) var<storage, read> stats: array<u32, 12>;
 @group(0) @binding(7) var fieldF: texture_2d<f32>;
 @group(0) @binding(8) var fieldG: texture_2d<f32>;
 @group(0) @binding(9) var selT: texture_2d<f32>;
@@ -983,6 +1066,8 @@ fn interp(p: vec2f, t: f32) -> vec3f {
   setGain(t);
   var mode = U.mode;
   if (mode == 0u && stats[1] > 0u && f32(stats[0]) > U.sceneFrac * f32(stats[1])) { mode = select(2u, 1u, t < 0.5); }
+  // a directing effect: the earlier drawing until the next one (the original timing)
+  if (mode == 0u && (stats[7] & U.fxMask) != 0u) { mode = 1u; }
   if (mode == 0u && in.pos.x < U.split) { mode = 1u; }
   var col: vec3f;
   switch mode {
@@ -1058,5 +1143,5 @@ fn interp(p: vec2f, t: f32) -> vec3f {
 }
 `;
 
-  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, sumK, pack, select, selectPlain, selectEns4, render, combine, combine4 };
+  S.WGSL = { ingest, toTensor, prep, conv, convReduce, deconv, deconvPlain, accum, sumK, pack, select, selectPlain, selectEns4, render, combine, combine4, fxStats, fxDecide };
 })();

@@ -14,6 +14,11 @@
     multiscale: true, // also infer RIFE at half resolution (large motion), used where the selection map prefers it (with hybrid)
     ensemble: true, // also infer RIFE on the swapped pair and average (2x inference, more accurate motion)
     ensemble4: false, // with ensemble: also on the mirrored pair both ways (4x inference in all, for fast GPUs)
+    // directing effects shown as drawn (not interpolated): their impact comes from the abrupt change
+    fxMotion: false, // sudden large motion (snaps, smears)
+    fxShake: false, // screen shake
+    fxFlash: false, // flashes
+    fxSensitivity: 50, // 0..100: higher = detected more readily
     masking: 0, // 0..100: show the nearer original frame where no motion is trusted
     sceneSensitivity: 60, // 0..100: higher = scene changes detected more readily
     gpuLimit: 'auto', // 'auto' (70 % with underruns, else 90 %) | 40..100 (%) | 'off': GPU load at which optional processing is turned off automatically
@@ -63,6 +68,8 @@
     ensemble: s.ensemble ? (s.ensemble4 ? 4 : true) : false,
     autotune: false, // measure the conv tilings on this GPU (once per model and size); off: no gain in the job on an RTX 3080
     bufferMs: Math.max(0, Math.min(500, +s.bufferMs || 0)),
+    fxMask: (s.fxMotion ? 1 : 0) | (s.fxShake ? 2 : 0) | (s.fxFlash ? 4 : 0),
+    fxSensitivity: s.fxSensitivity,
     masking: s.masking / 100,
     sceneFrac: 0.6 - (0.5 * s.sceneSensitivity) / 100, // default 60 -> 0.3 (normal pairs stay below ~0.1, cuts mostly above 0.45)
   });
