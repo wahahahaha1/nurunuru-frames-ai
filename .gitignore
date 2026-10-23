@@ -12,3 +12,6 @@ __pycache__/
 *.f32
 *.png
 !extension/icons/*.png
+
+# training outputs
+training/out/
