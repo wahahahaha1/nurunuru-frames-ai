@@ -45,7 +45,7 @@
   <div class="row"><span>入れ替えても推論して平均</span><label class="switch"><input type="checkbox" id="ensemble"><span></span></label></div>
   <div class="hint">前後のフレームを入れ替えた組でも AI を動かし、2 つの結果を平均します。AI の推論の偏りが打ち消され、動きが正確になります（AI の推論 2 回）。GPU が足りないときは自動でオフになります</div>
   <div class="row"><span>別の版の AI と組み合わせる</span><label class="switch"><input type="checkbox" id="crossModel"><span></span></label></div>
-  <div class="hint">「入れ替えても推論して平均」の 2 回目を、別の版の AI（RIFE 4.26）で推論します。版によって得意な場面が違うので、平均するとより正確になります（推論の回数は同じ。標準・高画質のとき）</div>
+  <div class="hint">「入れ替えても推論して平均」の 2 回目を、別の版の AI（RIFE 4.26）で推論します。版によって得意な場面が違うので、平均するとより正確になります（推論の回数は同じですが、処理は約 1 割増えます。標準・高画質のとき）。合成映像では平均 +0.1 dB（フェードやドット絵で効果大）、実際のアニメではほとんど差がありませんでした</div>
   <div class="row"><span>左右反転でも推論（高性能 GPU 向け）</span><label class="switch"><input type="checkbox" id="ensemble4"><span></span></label></div>
   <div class="hint">「入れ替えても推論して平均」に加えて、左右反転した組でも AI を動かします（AI の推論 4 回）。ドット絵や速い動きがさらに正確になります。GPU が足りないときは自動でオフになります</div>
   <div class="row"><span>大きな動きを高精度に（推論 3 回）</span><label class="switch"><input type="checkbox" id="anchors"><span></span></label></div>

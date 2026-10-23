@@ -13,8 +13,8 @@
     anchors: false, // also infer RIFE at t = 0.25 / 0.75 (3x inference), used where t = 0.5 extrapolates badly
     multiscale: true, // also infer RIFE at half resolution (large motion), used where the selection map prefers it (with hybrid)
     ensemble: true, // also infer RIFE on the swapped pair and average (2x inference, more accurate motion)
-    ensemble4: false,
-    crossModel: true, // with the two-way ensemble: infer the swapped pair with RIFE 4.26 (they err differently) // with ensemble: also on the mirrored pair both ways (4x inference in all, for fast GPUs)
+    ensemble4: false, // with ensemble: also on the mirrored pair both ways (4x inference in all, for fast GPUs)
+    crossModel: false, // with the two-way ensemble: infer the swapped pair with RIFE 4.26 (they err differently; +0.1 dB on the synthetic scenes, none measurable on real anime)
     // directing effects shown as drawn (not interpolated): their impact comes from the abrupt change
     fxMotion: false, // sudden large motion (snaps, smears)
     fxShake: false, // screen shake
@@ -67,7 +67,7 @@
     anchors: !!s.anchors,
     multiscale: !!s.multiscale,
     ensemble: s.ensemble ? (s.ensemble4 ? 4 : true) : false,
-    crossModel: s.crossModel !== false,
+    crossModel: !!s.crossModel,
     autotune: false, // measure the conv tilings on this GPU (once per model and size); off: no gain in the job on an RTX 3080
     bufferMs: Math.max(0, Math.min(500, +s.bufferMs || 0)),
     fxMask: (s.fxMotion ? 1 : 0) | (s.fxShake ? 2 : 0) | (s.fxFlash ? 4 : 0),

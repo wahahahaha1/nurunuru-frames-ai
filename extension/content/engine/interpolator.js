@@ -358,7 +358,7 @@
       const useBM = this.params.hybrid !== false;
       const e = this.params.ensemble;
       const useEns = e === 4 ? 4 : e ? 2 : 0;
-      const useCross = useEns === 2 && !!this.netX && this.params.crossModel !== false && sameArch(this.netX.spec, this.net.spec);
+      const useCross = useEns === 2 && !!this.netX && !!this.params.crossModel && sameArch(this.netX.spec, this.net.spec);
       return { useBM, useHalf: useBM && this.params.multiscale !== false, useAnchors: !!this.params.anchors, useEns, useCross };
     }
 
