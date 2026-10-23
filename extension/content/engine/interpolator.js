@@ -17,6 +17,8 @@
   const ANCHORS = [0.25, 0.75];
   const TUNE_VERSION = 2; // version of the auto-tuner's set of tilings
 
+  const sameArch = (a, b) => a.modulo === b.modulo && a.scales.join() === b.scales.join();
+
   class Interpolator {
     constructor(device, net, params) {
       this.device = device;
@@ -27,6 +29,9 @@
       this.netS = net.sibling('S');
       // the ensemble's runs inferred together as one batch (fewer, larger dispatches), when memory allows
       this.netE = null;
+      // another version of RIFE (same architecture, other weights) for the ensemble's swapped run:
+      // the two versions err differently, so their average beats either's own ensemble (setCross)
+      this.netX = null;
       this.params = { ...S.TUNING, ...S.PRESETS.standard, ...params };
       const W = S.WGSL;
       const mod = (code, label) => device.createShaderModule({ code, label });
@@ -141,11 +146,23 @@
       this.netH.destroyResources();
       this.netS.destroyResources();
       this.dropEnsNet();
+      if (this.netX) this.netX.destroyResources();
       this.net.destroyResources(); // the previous model's scratch (reallocated if switched back)
       this.net = net;
       this.netH = net.sibling('H');
       this.netS = net.sibling('S');
       if (src) this.configure(...src);
+    }
+
+    // The second version for the ensemble (a network loaded by the player), or null.
+    setCross(net) {
+      if (this.netX && net && this.netX.parent === net) return;
+      if (this.netX) {
+        if (this.res) this.netX.forgetHeads(this.res.frames.filter((f) => f.tensorX).map((f) => f.tensorX));
+        this.netX.destroyResources();
+      }
+      this.netX = net ? net.sibling('X') : null;
+      if (this.res) for (const f of this.res.frames) f.featX = false;
     }
 
     setParams(params) {
@@ -179,6 +196,7 @@
       const half = S.RifeNet.modelSize(srcW, srcH, Math.round(mw / 2) / S.RifeNet.widthFactor(srcW, srcH), this.net.spec.modulo);
       this.netH.configure(half.cw, half.ch);
       this.netS.destroyResources(); // (configured when first needed)
+      if (this.netX) this.netX.destroyResources();
       this.dropEnsNet();
       const uni = (data) => {
         const b = d.createBuffer({ size: Math.max(16, data.byteLength), usage: BU.UNIFORM | BU.COPY_DST });
@@ -209,6 +227,9 @@
           flowH: d.createTexture({ size: [half.cw, half.ch], format: 'rgba16float', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
           maskH: d.createTexture({ size: [half.cw, half.ch], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING }),
           tensorM: null, // mirrored tensor (4-way ensemble), allocated when first needed
+          tensorX: null, // tensor with the second version's Head features (allocated when first needed)
+          featX: false, // its Head features are submitted
+          hasTensorX: false, // it holds this frame
           featM: false, // Head features of the mirrored tensor are submitted
           hasTensorM: false, // the mirrored tensor holds this frame
           featH: false, // Head features of the half-resolution tensor are submitted
@@ -303,7 +324,7 @@
     }
 
     rebuildNets() {
-      for (const n of [this.net, this.netS, this.netH, this.netE]) {
+      for (const n of [this.net, this.netS, this.netH, this.netE, this.netX]) {
         if (!n || !n.res) continue;
         const { cw, ch } = n.res;
         n.destroyResources();
@@ -315,11 +336,12 @@
     typicalKeys() {
       const r = this.res;
       const o = this.options();
-      const opt = `${o.useBM}/${o.useHalf}/${o.useAnchors}/${o.useEns}`;
+      const opt = `${o.useBM}/${o.useHalf}/${o.useAnchors}/${o.useEns}/${o.useCross}`;
       if (!r.jobKeys.has(opt)) {
         const heads = [
           ...this.net.headSteps(r.frames[0].tensor),
           ...(o.useEns === 4 ? this.net.headSteps(this.mirrored(r.frames[0])) : []),
+          ...(o.useCross ? this.netX.headSteps(this.crossTensor(r.frames[0])) : []),
           ...(o.useHalf ? this.netH.headSteps(r.frames[0].tensorH) : []),
         ];
         const steps = [...heads, ...this.pairSteps(r.frames[0], r.frames[1], o)];
@@ -330,11 +352,33 @@
 
     // Which parts a job runs with the current parameters: block matching (hybrid), half-resolution
     // RIFE (multiscale, needs the hybrid's selection map), extra anchors, ensemble (useEns = 2: RIFE
-    // also on the swapped pair; 4: and on the mirrored pair both ways).
+    // also on the swapped pair; 4: and on the mirrored pair both ways), the swapped run by the second
+    // version (useCross: two-way ensemble with a second version of the same architecture loaded).
     options() {
       const useBM = this.params.hybrid !== false;
       const e = this.params.ensemble;
-      return { useBM, useHalf: useBM && this.params.multiscale !== false, useAnchors: !!this.params.anchors, useEns: e === 4 ? 4 : e ? 2 : 0 };
+      const useEns = e === 4 ? 4 : e ? 2 : 0;
+      const useCross = useEns === 2 && !!this.netX && this.params.crossModel !== false && sameArch(this.netX.spec, this.net.spec);
+      return { useBM, useHalf: useBM && this.params.multiscale !== false, useAnchors: !!this.params.anchors, useEns, useCross };
+    }
+
+    // The frame tensor for the second version (its own Head features; allocated on first use).
+    crossTensor(f) {
+      if (!this.netX.res) this.netX.configure(this.res.mw, this.res.mh);
+      if (!f.tensorX) {
+        const r = this.res;
+        f.tensorX = this.device.createBuffer({ size: S.RifeNet.tensorSize(r.pw, r.ph) * 4, usage: BU.STORAGE });
+        f.tensorXBG = this.device.createBindGroup({
+          layout: this.tensorPipe.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.samp },
+            { binding: 1, resource: f.view },
+            { binding: 2, resource: { buffer: f.tensorX } },
+            { binding: 3, resource: { buffer: r.tensorU } },
+          ],
+        });
+      }
+      return f.tensorX;
     }
 
     // The network inferring the ensemble's `items` runs as one batch at the model size, or null where
@@ -377,7 +421,7 @@
     // Steps of the pair (a -> b) after the Head features: block matching, RIFE at t = 0.5 (full and
     // half resolution), selection map, then the extra anchor timesteps (each part if used).
     // steps.mainEnd = index after which the pair can be drawn.
-    pairSteps(a, b, { useBM, useHalf, useAnchors, useEns }) {
+    pairSteps(a, b, { useBM, useHalf, useAnchors, useEns, useCross }) {
       const steps = [];
       const r = this.res;
       // with the selection map, scene statistics come from it (brightness-compensated)
@@ -393,8 +437,12 @@
       const e = r.ens;
       const runs = [];
       if (useBM) runs.push(this.bm.steps(a, b));
-      const netE = useEns ? this.ensNet(useEns) : null;
-      if (netE) {
+      const netE = useEns && !useCross ? this.ensNet(useEns) : null;
+      if (useCross) {
+        // (two networks: not batched)
+        runs.push(this.net.job(a.tensor, b.tensor, { flowView: e.flowNView, maskView: e.maskNView, stats }));
+        runs.push(this.netX.job(this.crossTensor(b), this.crossTensor(a), { flowView: e.flowSView, maskView: e.maskSView, stats: r.scratchStats }));
+      } else if (netE) {
         const items = [
           { a: a.tensor, b: b.tensor, out: { flowView: e.flowNView, maskView: e.maskNView, stats } },
           { a: b.tensor, b: a.tensor, out: { flowView: e.flowSView, maskView: e.maskSView, stats: r.scratchStats } },
@@ -529,6 +577,7 @@
       if (!this.res) return;
       this.net.forgetHeads(this.res.frames.map((f) => f.tensor));
       this.net.forgetHeads(this.res.frames.filter((f) => f.tensorM).map((f) => f.tensorM));
+      if (this.netX) this.netX.forgetHeads(this.res.frames.filter((f) => f.tensorX).map((f) => f.tensorX));
       this.netH.forgetHeads(this.res.frames.map((f) => f.tensorH));
       for (const f of this.res.frames) {
         f.tex.destroy();
@@ -538,6 +587,7 @@
         f.sel.destroy();
         f.tensorH.destroy();
         if (f.tensorM) f.tensorM.destroy();
+        if (f.tensorX) f.tensorX.destroy();
         f.flowH.destroy();
         f.maskH.destroy();
         f.stats.destroy();
@@ -566,6 +616,7 @@
       this.netH.destroyResources();
       this.netS.destroyResources();
       this.dropEnsNet();
+      if (this.netX) this.netX.destroyResources();
       this.bm.destroy();
       this.renderU.destroy();
       this.zeroTex.destroy();
@@ -626,6 +677,8 @@
       f.hasTensorH = this.options().useHalf;
       f.hasTensorM = this.options().useEns === 4;
       f.featM = false;
+      f.hasTensorX = this.options().useCross;
+      f.featX = false;
       f.sameAs = null;
       f.drawId = f.id; // id of the frame that first showed this drawing
       f.pairDrawId = -1;
@@ -646,6 +699,11 @@
       if (f.hasTensorM) {
         this.mirrored(f);
         cp.setBindGroup(0, f.tensorMBG);
+        cp.dispatchWorkgroups(Math.ceil(r.pw / 16), Math.ceil(r.ph / 16));
+      }
+      if (f.hasTensorX) {
+        this.crossTensor(f);
+        cp.setBindGroup(0, f.tensorXBG);
         cp.dispatchWorkgroups(Math.ceil(r.pw / 16), Math.ceil(r.ph / 16));
       }
       this.bm.encodeLuma(cp, f);
@@ -684,6 +742,7 @@
       // (half resolution was switched on after one of the frames came in: its half tensor is stale)
       if (!job.a.hasTensorH || !job.b.hasTensorH) o.useHalf = false;
       if (o.useEns === 4 && (!job.a.hasTensorM || !job.b.hasTensorM)) o.useEns = 2;
+      if (o.useCross && (!job.a.hasTensorX || !job.b.hasTensorX)) o.useCross = false;
       this.demand++;
       for (const f of [job.a, job.b]) {
         if (!f.feat) {
@@ -693,6 +752,10 @@
         if (o.useEns === 4 && !f.featM) {
           steps.push(...this.net.headSteps(this.mirrored(f)));
           job.marks.push([steps.length, f, 'featM']);
+        }
+        if (o.useCross && !f.featX) {
+          steps.push(...this.netX.headSteps(this.crossTensor(f)));
+          job.marks.push([steps.length, f, 'featX']);
         }
         if (o.useHalf && !f.featH) {
           steps.push(...this.netH.headSteps(f.tensorH));

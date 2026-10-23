@@ -14,8 +14,10 @@
 
   // An engine for the source size with two synthetic frames ingested; returns the steps of the job
   // between them (one Head, as in steady playback) and the two frame records.
+  let crossNet = null; // RIFE 4.26, the default ensemble's second version (loaded by run())
   function makeJob(device, net, params) {
     const eng = new S.Interpolator(device, net, params);
+    if (crossNet) eng.setCross(crossNet);
     eng.configure(SRC[0], SRC[1]);
     const r = eng.res;
     const frame = (seed) => {
@@ -215,6 +217,7 @@
     obody.innerHTML = '';
     try {
       const device = await S.getDevice();
+      crossNet = await S.getRifeNet(device, 'rife-4.26');
       let err = null;
       device.onuncapturederror = (e) => (err = err || e.error.message);
       const info = (await navigator.gpu.requestAdapter())?.info || {};
@@ -248,7 +251,8 @@
         if (preset === 'standard') {
           // optional parts at this preset
           const variants = [
-            ['（比較）推論をまとめない', { hybrid: true, multiscale: true, ensemble: true, batchEns: false }],
+            ['（比較）別の版の AI と組み合わせない', { hybrid: true, multiscale: true, ensemble: true, crossModel: false }],
+            ['（比較）別の版と組み合わせず、推論をまとめない', { hybrid: true, multiscale: true, ensemble: true, crossModel: false, batchEns: false }],
             ['＋ 左右反転でも推論（推論 4 回）', { hybrid: true, multiscale: true, ensemble: 4 }],
             ['（比較）左右反転・推論をまとめない', { hybrid: true, multiscale: true, ensemble: 4, batchEns: false }],
             ['入れ替えての推論なし', { hybrid: true, multiscale: true, ensemble: false }],

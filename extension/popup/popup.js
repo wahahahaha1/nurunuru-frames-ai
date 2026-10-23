@@ -48,7 +48,7 @@
       $(id).value = settings[id];
       $(id + 'Out').textContent = fmt[id](settings[id]);
     }
-    for (const id of ['hybrid', 'multiscale', 'ensemble', 'ensemble4', 'anchors', 'anime', 'fxMotion', 'fxShake', 'fxFlash', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).checked = settings[id];
+    for (const id of ['hybrid', 'multiscale', 'ensemble', 'crossModel', 'ensemble4', 'anchors', 'anime', 'fxMotion', 'fxShake', 'fxFlash', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).checked = settings[id];
   }
 
   function save(patch) {
@@ -70,7 +70,7 @@
     $(id).oninput = (e) => ($(id + 'Out').textContent = fmt[id](+e.target.value));
     $(id).onchange = (e) => save({ [id]: +e.target.value });
   }
-  for (const id of ['hybrid', 'multiscale', 'ensemble', 'ensemble4', 'anchors', 'anime', 'fxMotion', 'fxShake', 'fxFlash', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).onchange = (e) => save({ [id]: e.target.checked });
+  for (const id of ['hybrid', 'multiscale', 'ensemble', 'crossModel', 'ensemble4', 'anchors', 'anime', 'fxMotion', 'fxShake', 'fxFlash', 'audioSync', 'demo', 'showVectors', 'osd']) $(id).onchange = (e) => save({ [id]: e.target.checked });
 
   $('bench').onclick = (e) => {
     e.preventDefault();

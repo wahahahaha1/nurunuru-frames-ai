@@ -99,7 +99,7 @@
 
     applySettings(s) {
       const o = this.settings;
-      const engineChanged = ['preset', 'hybrid', 'multiscale', 'anchors', 'ensemble', 'ensemble4', 'gpuLimit'].some((k) => s[k] !== o[k]);
+      const engineChanged = ['preset', 'hybrid', 'multiscale', 'anchors', 'ensemble', 'ensemble4', 'crossModel', 'gpuLimit'].some((k) => s[k] !== o[k]);
       if (engineChanged || this.perf.stopped) {
         // the user changed something: forget automatic downgrades (and a stop) and try again
         if (this.perf.stopped) this.failed = null;
@@ -127,6 +127,20 @@
       params.bufferFrames = Math.ceil((params.bufferMs / 1000) * this.fpsTier());
       this.engine.setParams(params);
       if (this.engine.res !== old) this.flush();
+      // the ensemble's second version (RIFE 4.26 with 4.25), loaded once when first wanted
+      if (params.crossModel && params.ensemble === true && params.model === 'rife-4.25' && !this.engine.netX && !this.loadingCross && !this.crossFailed) {
+        this.loadingCross = true;
+        S.getRifeNet(this.device, 'rife-4.26').then(
+          (net) => {
+            this.loadingCross = false;
+            if (this.active && this.engine) this.engine.setCross(net);
+          },
+          (e) => {
+            this.loadingCross = false;
+            this.crossFailed = e.message; // (keep the single-version ensemble)
+          }
+        );
+      }
       if (params.model !== this.engine.net.model && this.loadingModel !== params.model) {
         // another model: load it (once per page), then switch
         this.loadingModel = params.model;
