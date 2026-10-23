@@ -201,7 +201,7 @@ def make_scene(r, H, W, dev):
     """One scene: a function render(t) -> (3, H, W)."""
     bg = make_texture(r, dev)
     big = 0.45 * max(H, W)
-    bgv = speed(r, big) if r.p(0.8) else (0.0, 0.0)
+    bgv = speed(r, big) if r.p(0.6) else (0.0, 0.0)  # (a still background with small motion in front is common)
     bgz = math.exp(r.u(-0.2, 0.2)) if r.p(0.25) else 1.0
     bgr = r.u(-0.12, 0.12) if r.p(0.12) else 0.0
     bgo = (r.u(-500, 500), r.u(-500, 500))
