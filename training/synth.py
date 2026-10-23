@@ -142,12 +142,15 @@ def speed(r, big):
     return mag * math.cos(a), mag * math.sin(a)
 
 
-def render_layer(tex, mask_fn, xs, ys, c, s, th):
-    """Colour and alpha of a layer whose local origin is at screen point c, zoomed s, rotated th."""
+def render_layer(tex, mask_fn, xs, ys, c, s, th, deform=None):
+    """Colour and alpha of a layer whose local origin is at screen point c, zoomed s, rotated th;
+    deform(u, v) -> (u, v) bends the shape (non-rigid motion)."""
     dx, dy = xs - c[0], ys - c[1]
     ct, st = math.cos(-th), math.sin(-th)
     u = (dx * ct - dy * st) / s
     v = (dx * st + dy * ct) / s
+    if deform is not None:
+        u, v = deform(u, v)
     col = tex(u, v)
     if mask_fn is None:
         return col, None
@@ -180,6 +183,20 @@ def make_mask(r):
     return m
 
 
+def make_bend(r, dev):
+    """Non-rigid motion of an object (limbs swinging, cloth, faces): a smooth random displacement
+    field plus a sinusoidal sway, both growing with t (px in the object's own coordinates)."""
+    grid = torch.rand(2, 8, 8, device=dev)
+    sc = r.u(15, 60)
+    amp = r.u(2, 14)
+    sway, wl, ph = r.u(0, 12), r.u(20, 80), r.u(0, 2 * math.pi)
+
+    def f(u, v, t):
+        d = (periodic_sample(grid, u / sc, v / sc) - 0.5) * 2 * amp * t
+        return u + d[0] + sway * t * torch.sin(v / wl + ph), v + d[1]
+    return f
+
+
 def make_scene(r, H, W, dev):
     """One scene: a function render(t) -> (3, H, W)."""
     bg = make_texture(r, dev)
@@ -202,6 +219,7 @@ def make_scene(r, H, W, dev):
             'z': math.exp(r.u(-0.7, 0.7)) if approach else (math.exp(r.u(-0.1, 0.1)) if r.p(0.3) else 1.0),
             'w': r.u(-0.4, 0.4) if r.p(0.2) else 0.0,
             'acc': r.u(-0.25, 0.25) if r.p(0.3) else 0.0,
+            'bend': make_bend(r, dev) if r.p(0.4) else None,
         })
     gain = r.u(-0.35, 0.35) if r.p(0.1) else 0.0
     iy, ix = torch.meshgrid(torch.arange(H * SS, device=dev, dtype=torch.float32), torch.arange(W * SS, device=dev, dtype=torch.float32), indexing='ij')
@@ -216,7 +234,8 @@ def make_scene(r, H, W, dev):
         for o in objs:
             k = t + o['acc'] * t * (t - 1)
             c = (o['c0'][0] + o['v'][0] * k, o['c0'][1] + o['v'][1] * k)
-            oc, (a, outline) = render_layer(o['tex'], o['mask'], xs, ys, c, o['s0'] * o['z'] ** t, o['w'] * t)
+            bend = o['bend']
+            oc, (a, outline) = render_layer(o['tex'], o['mask'], xs, ys, c, o['s0'] * o['z'] ** t, o['w'] * t, (lambda u, v, b=bend, t=t: b(u, v, t)) if bend else None)
             if outline is not None:
                 oc = torch.where(outline[None], o['line'], oc)
             col = col * (1 - a) + oc * a
