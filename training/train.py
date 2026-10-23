@@ -36,8 +36,9 @@ def psnr(x, y):
 
 
 class RealFrames:
-    """Triplets of consecutive frames (k, k + 1, k + 2) from folders of PNG sequences (one folder per
-    clip); the middle frame is the target at t = 0.5. Frames are loaded at half size."""
+    """Triplets of consecutive frames (k, k + 1, k + 2) from folders of PNG / JPEG sequences (one
+    folder per clip); the middle frame is the target at t = 0.5. Frames wider than 1280 px are loaded
+    at half size (the extension infers at about 960 px wide)."""
 
     def __init__(self, root, size):
         from PIL import Image
@@ -45,11 +46,11 @@ class RealFrames:
         self.size = size
         self.clips = []
         for d in sorted(p for p in Path(root).iterdir() if p.is_dir()):
-            files = sorted(d.glob('*.png'))
+            files = sorted(list(d.glob('*.png')) + list(d.glob('*.jpg')))
             if len(files) >= 3:
                 self.clips.append(files)
         if not self.clips:
-            raise SystemExit(f'no PNG sequences found under {root}')
+            raise SystemExit(f'no PNG / JPEG sequences found under {root} (one folder per clip)')
         n = sum(len(c) for c in self.clips)
         print(f'real frames: {len(self.clips)} clips, {n} frames')
         self.cache = {}
@@ -57,7 +58,8 @@ class RealFrames:
     def load(self, f):
         if f not in self.cache:
             im = self.Image.open(f).convert('RGB')
-            im = im.resize((im.width // 2, im.height // 2), self.Image.BILINEAR)
+            if im.width > 1280:
+                im = im.resize((im.width // 2, im.height // 2), self.Image.BILINEAR)
             self.cache[f] = torch.from_numpy(np.asarray(im).copy()).permute(2, 0, 1)
             if len(self.cache) > 3000:
                 self.cache.pop(next(iter(self.cache)))
@@ -99,7 +101,7 @@ def main():
     ap.add_argument('--size', type=int, default=256)
     ap.add_argument('--lr', type=float, default=2e-5)
     ap.add_argument('--keep', type=float, default=1e-2, help='pull towards the original weights (keeps what it already does well)')
-    ap.add_argument('--real', default=None, help='folder of PNG sequences (optional)')
+    ap.add_argument('--real', default=None, help='folder of PNG / JPEG sequences, one subfolder per clip (optional)')
     ap.add_argument('--real-share', type=float, default=0.3)
     ap.add_argument('--eval-every', type=int, default=1000)
     ap.add_argument('--seed', type=int, default=1)
