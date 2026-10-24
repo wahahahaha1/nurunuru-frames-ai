@@ -14,6 +14,7 @@
     multiscale: true, // also infer RIFE at half resolution (large motion), used where the selection map prefers it (with hybrid)
     ensemble: true, // also infer RIFE on the swapped pair and average (2x inference, more accurate motion)
     ensemble4: false, // with ensemble: also on the mirrored pair both ways (4x inference in all, for fast GPUs)
+    tunedModel: false, // RIFE 4.25 fine-tuned by this project (training/) in place of the original (standard / quality)
     crossModel: false, // with the two-way ensemble: infer the swapped pair with RIFE 4.26 (they err differently; +0.1 dB on the synthetic scenes, none measurable on real anime)
     // directing effects shown as drawn (not interpolated): their impact comes from the abrupt change
     fxMotion: false, // sudden large motion (snaps, smears)
@@ -63,6 +64,7 @@
   // Settings -> engine parameters
   S.engineParams = (s) => ({
     ...(S.PRESETS[s.preset] || S.PRESETS.standard),
+    ...(s.tunedModel && (S.PRESETS[s.preset] || S.PRESETS.standard).model === 'rife-4.25' ? { model: 'rife-4.25-nnf' } : {}),
     hybrid: s.hybrid !== false,
     anchors: !!s.anchors,
     multiscale: !!s.multiscale,

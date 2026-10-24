@@ -12,6 +12,7 @@
   // of (coarsest block: 1 / scale, then two stride-2 convs)
   S.RIFE_MODELS = {
     'rife-4.25': { file: 'models/rife-v4.25.bin', scales: [16, 8, 4, 2, 1], modulo: 64 },
+    'rife-4.25-nnf': { file: 'models/rife-v4.25-nnf.bin', scales: [16, 8, 4, 2, 1], modulo: 64 }, // (4.25 fine-tuned by this project: training/)
     'rife-4.26': { file: 'models/rife-v4.26.bin', scales: [16, 8, 4, 2, 1], modulo: 64 }, // (4.25's architecture; the ensemble's second version)
     'rife-4.25-lite': { file: 'models/rife-v4.25-lite.bin', scales: [32, 16, 8, 4, 1], modulo: 128 },
   };
