@@ -52,12 +52,12 @@ py train.py
 
 合成映像だけで学習すると、本物の映像らしさを少しずつ忘れることがあります（予備の学習でも、合成映像では良くなったのに本物のアニメでは変わらない、という結果でした）。自由に使える本物の映像を混ぜると安定します。
 
-1. Blender Studio のサイト（studio.blender.org）の Films から、CC BY ライセンスの作品（「Spring」「Sprite Fright」など）の動画をダウンロードします。CC BY は、出典を示せば学習にも使えるライセンスです。著作権のある動画（アニメの本編やトレーラーなど）は使わないでください。学習した AI は公開されるためです。
+1. download.blender.org から、CC BY ライセンスの Blender の作品の動画をダウンロードします（ログイン不要）。これまでの学習では「Caminandes 2: Gran Dillama」「Big Buck Bunny」「Sintel」（いずれも CC BY 3.0）を使いました。Blender Studio のサイト（studio.blender.org）の作品は、ダウンロードにログインが必要です。CC BY は、出典を示せば学習にも使えるライセンスです。著作権のある動画（アニメの本編やトレーラーなど）は使わないでください。学習した AI は公開されるためです。エンドクレジットの部分は除いてください（文字が流れるだけで、学習の役に立たないため）。
 2. 作品ごとにフォルダを作り、ffmpeg でフレームを書き出します（例：`real` フォルダの下に作品ごとのフォルダ）。
 
 ```
-mkdir real\spring
-ffmpeg -i spring.mp4 -vf scale=960:-2 -q:v 2 real\spring\%05d.jpg
+mkdir real\sintel
+ffmpeg -i sintel.mp4 -vf scale=960:-2 -q:v 2 real\sintel\%05d.jpg
 ```
 
 3. 学習のときに `--real` で指定します（学習の 3 割が本物の映像になります）。
